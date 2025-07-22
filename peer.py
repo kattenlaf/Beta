@@ -13,7 +13,7 @@ LOCAL_HOST = '127.0.0.1'
 FILE_BUFFER_SIZE = 16000 # 16KB per file size, 16000 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
 PEERS_TO_SHARE_WITH = 5
-TIMEOUT_FOR_PEER_DATA = 3
+TIMEOUT_FOR_PEER_DATA = 30
 
 # Each peer/node is both a client and a server, should have way to send file and receive
 # https://stackoverflow.com/questions/70962218/understanding-the-requisites-that-allow-bittorrent-peers-to-connect-to-each-othe
@@ -42,36 +42,38 @@ class Peer:
 
     # bare bones implementation of how selector sockets will work
     def service_connection(self, key, mask):
-        client_socket = key.fileobj
+        socket_connection = key.fileobj
         data = key.data
-        remote_addr = client_socket.getpeername()
+        remote_addr = socket_connection.getpeername()
         if mask & selectors.EVENT_READ:
-            self.read_data(client_socket, data)
+            self.read_data(socket_connection, data)
+            # TODO implement
+        self.populate_data_to_send(data)
         if mask & selectors.EVENT_WRITE and remote_addr in self.times_peers_last_sent:
             if data.outb:
-                bytes_sent = client_socket.send(data.outb[:TEST_FILE_BUFFER_SIZE])
-                client_socket.send(b'\n')
+                bytes_sent = socket_connection.send(data.outb[:TEST_FILE_BUFFER_SIZE])
+                socket_connection.send(b'\n')
                 print(f'Sent to client\n{data.outb[:bytes_sent]}')
                 data.outb = data.outb[bytes_sent:]
-            else:
-                # Close socket if we have no more data to write to it?
-                self.socket_event_selector.unregister(client_socket)
-                client_socket.close()
 
-    def read_data(self, client_socket, data):
-        data_received = client_socket.recv(TEST_FILE_BUFFER_SIZE)
+    def populate_data_to_send(self, data):
+        # Solution to find what bytes/file chunk to send here
+        data.outb = b"Hello from server"
+
+    def read_data(self, socket_connection, data):
+        data_received = socket_connection.recv(TEST_FILE_BUFFER_SIZE)
         data_received = self.format_data(data_received, selectors.EVENT_READ)
-        client_socket_address = client_socket.getpeername()
+        socket_connection_address = socket_connection.getpeername()
         if data_received:
-            self.times_peers_last_sent[client_socket_address] = datetime.now()
-            data.outb += data_received
+            self.times_peers_last_sent[socket_connection_address] = datetime.now()
+            data.inb += data_received
         else:
             # Unregister the connection to that client if 30 seconds has past since it last sent a packet
-            time_of_last_packet = self.times_peers_last_sent[client_socket_address]
+            time_of_last_packet = self.times_peers_last_sent[socket_connection_address]
             if (datetime.now() - time_of_last_packet).total_seconds() > TIMEOUT_FOR_PEER_DATA:
-                self.socket_event_selector.unregister(client_socket)
-                self.times_peers_last_sent.pop(client_socket_address)
-                client_socket.close()
+                self.socket_event_selector.unregister(socket_connection)
+                self.times_peers_last_sent.pop(socket_connection_address)
+                socket_connection.close()
 
     def format_data(self, data, type):
         if type == selectors.EVENT_READ:
