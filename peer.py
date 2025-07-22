@@ -11,9 +11,9 @@ from datetime import datetime
 DEFAULT_PORT = 80
 LOCAL_HOST = '127.0.0.1'
 FILE_BUFFER_SIZE = 16000 # 16KB per file size, 16000 BYTES
-TEST_FILE_BUFFER_SIZE = 128 # for testing purposes
+TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
 PEERS_TO_SHARE_WITH = 5
-TIMEOUT_FOR_PEER_DATA = 30
+TIMEOUT_FOR_PEER_DATA = 3
 
 # Each peer/node is both a client and a server, should have way to send file and receive
 # https://stackoverflow.com/questions/70962218/understanding-the-requisites-that-allow-bittorrent-peers-to-connect-to-each-othe
@@ -44,38 +44,40 @@ class Peer:
     def service_connection(self, key, mask):
         client_socket = key.fileobj
         data = key.data
+        remote_addr = client_socket.getpeername()
         if mask & selectors.EVENT_READ:
-            # read data from the socket
-            # data received here will be different
-            data_received = client_socket.recv(TEST_FILE_BUFFER_SIZE)
-            if data_received:
-                self.times_peers_last_sent[client_socket.getpeername()] = datetime.now()
-                data.outb += data_received
-            else:
-                # Unregister the connection to that client if 30 seconds has past since it last sent a packet
-                time_of_last_packet = self.times_peers_last_sent[client_socket.getpeername()]
-                if (datetime.now() - time_of_last_packet).total_seconds() > TIMEOUT_FOR_PEER_DATA:
-                    self.socket_event_selector.unregister(client_socket)
-                    client_socket.close()
-        if mask & selectors.EVENT_WRITE:
+            self.read_data(client_socket, data)
+        if mask & selectors.EVENT_WRITE and remote_addr in self.times_peers_last_sent:
             if data.outb:
                 bytes_sent = client_socket.send(data.outb[:TEST_FILE_BUFFER_SIZE])
+                client_socket.send(b'\n')
                 print(f'Sent to client\n{data.outb[:bytes_sent]}')
                 data.outb = data.outb[bytes_sent:]
+            else:
+                # Close socket if we have no more data to write to it?
+                self.socket_event_selector.unregister(client_socket)
+                client_socket.close()
 
-    def read_data(self, socket):
-        data = socket.recv(FILE_BUFFER_SIZE)
-        if data:
-            socket.send(b'Data Received')
+    def read_data(self, client_socket, data):
+        data_received = client_socket.recv(TEST_FILE_BUFFER_SIZE)
+        data_received = self.format_data(data_received, selectors.EVENT_READ)
+        client_socket_address = client_socket.getpeername()
+        if data_received:
+            self.times_peers_last_sent[client_socket_address] = datetime.now()
+            data.outb += data_received
         else:
-            # probably keep a timer dictionary object of this sockets address so if 30 seconds have passed and it hasn't sent data we kick it off
-            self.socket_event_selector.unregister(socket)
-            socket.close()
+            # Unregister the connection to that client if 30 seconds has past since it last sent a packet
+            time_of_last_packet = self.times_peers_last_sent[client_socket_address]
+            if (datetime.now() - time_of_last_packet).total_seconds() > TIMEOUT_FOR_PEER_DATA:
+                self.socket_event_selector.unregister(client_socket)
+                self.times_peers_last_sent.pop(client_socket_address)
+                client_socket.close()
 
-    def send_data(self, conn, data):
-        # https://stackoverflow.com/questions/34252273/what-is-the-difference-between-socket-send-and-socket-sendall
-        conn.sendall(data)
+    def format_data(self, data, type):
+        if type == selectors.EVENT_READ:
+            data = data.rstrip()
 
+        return data
 
     def start_peer(self):
         while True:
