@@ -37,20 +37,25 @@ class Peer:
         self.torrent_details = torrent.Torrent()
 
     def retrieve_peers_from_tracker(self):
-        parameters = {}
-        config_yaml = helpers.get_config_yaml()
-        url_parameters = config_yaml.get(PARAMETERS)
-        for param in url_parameters[GET_TRACKER]:
-            parameters[param] = self.torrent_details.lookup_dict[param]
+        url_parameter_node = helpers.get_config_yaml().get(PARAMETERS)
+        parameter = self.get_parameters_for_requests(url_parameter_node, GET_TRACKER)
         try:
-            # https://stackoverflow.com/questions/58282768/how-to-send-requests-to-bittorrent-tracker-using-python-requests
-            response = requests.get(self.torrent_details.announce, params=parameters) # torrent not founded error, TODO fix tomorrow
+            response = requests.get(self.torrent_details.announce, params=parameters)
             print(response)
         except requests.exceptions.RequestException as exc:
             print(f'Exception making request to tracker: {exc}')
             # retry here potentially
         except Exception as e:
             print(f'Unhandled exception when making request to tracker: {exc}')
+
+    # Retrieve values from config file node for retrieving parameters needed for a given request
+    def get_parameters_for_requests(self, url_parameter_node, request_type):
+        parameters = {}
+        for param in url_parameter_node[request_type]:
+            parameters[param] = self.torrent_details.lookup_dict[param]
+
+        return parameters
+
 
     def setup_server_sock(self):
         self.server_sock.bind((LOCAL_HOST, DEFAULT_PORT))
