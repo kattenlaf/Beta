@@ -1,2 +1,5 @@
 references_and_knowledge.txt
 https://blog.jse.li/posts/torrent/ - building torrent client from the ground up in Go
+
+https://stackoverflow.com/questions/2572521/extract-the-sha1-hash-from-a-torrent-file/4173411#4173411
+https://stackoverflow.com/questions/44803689/http-request-to-the-torrent-tracker-in-python

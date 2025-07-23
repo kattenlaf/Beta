@@ -1,1 +1,10 @@
 torrent_file_path: 'resources/debian_practice.torrent'
+url_parameters:
+  get_tracker:
+    - 'info_hash'
+    - 'peer_id'
+    - 'port'
+    - 'uploaded'
+    - 'downloaded'
+    - 'compact'
+    - 'left'

@@ -1,3 +1,4 @@
+import helpers
 import torrent
 
 import types
@@ -6,6 +7,8 @@ import threading
 import multiprocessing
 import selectors # https://realpython.com/python-sockets/
 from datetime import datetime
+import urllib
+import requests
 
 # https://docs.python.org/3/library/socket.html
 
@@ -15,6 +18,11 @@ FILE_BUFFER_SIZE = 16384 # 16KB per file size, 16384 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
 PEERS_TO_SHARE_WITH = 5
 TIMEOUT_FOR_PEER_DATA = 30
+
+# Config key url parameters
+PARAMETERS = 'url_parameters'
+GET_TRACKER = 'get_tracker'
+
 
 # Each peer/node is both a client and a server, should have way to send file and receive
 # https://stackoverflow.com/questions/70962218/understanding-the-requisites-that-allow-bittorrent-peers-to-connect-to-each-othe
@@ -27,6 +35,22 @@ class Peer:
         self.socket_event_selector = selectors.DefaultSelector()
         self.times_peers_last_sent = {}
         self.torrent_details = torrent.Torrent()
+
+    def retrieve_peers_from_tracker(self):
+        parameters = {}
+        config_yaml = helpers.get_config_yaml()
+        url_parameters = config_yaml.get(PARAMETERS)
+        for param in url_parameters[GET_TRACKER]:
+            parameters[param] = self.torrent_details.lookup_dict[param]
+        try:
+            # https://stackoverflow.com/questions/58282768/how-to-send-requests-to-bittorrent-tracker-using-python-requests
+            response = requests.get(self.torrent_details.announce, params=parameters) # torrent not founded error, TODO fix tomorrow
+            print(response)
+        except requests.exceptions.RequestException as exc:
+            print(f'Exception making request to tracker: {exc}')
+            # retry here potentially
+        except Exception as e:
+            print(f'Unhandled exception when making request to tracker: {exc}')
 
     def setup_server_sock(self):
         self.server_sock.bind((LOCAL_HOST, DEFAULT_PORT))
@@ -90,7 +114,10 @@ class Peer:
 
 
     def start(self):
+        ping_tracker_for_info = True
         while True:
+            if ping_tracker_for_info:
+                self.retrieve_peers_from_tracker()
             events = self.socket_event_selector.select(timeout=None)
             for selector_key, event_mask in events:
                 if selector_key.data is None:
