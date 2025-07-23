@@ -1,12 +1,12 @@
-import peer
+import peer as p
 
-
-def execute():
-    print("Program Start")
-    p = peer.Peer()
-    p.setup_server_sock()
-    p.start_peer()
-
+# example - https://github.com/gallexis/PyTorrent
 
 if __name__ == '__main__':
-    execute()
+    peer = p.Peer()
+
+    # Run
+    peer.setup_server_sock()
+    print("Program Start")
+    peer.start()
+
