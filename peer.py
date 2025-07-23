@@ -1,5 +1,6 @@
-import types
+import torrent
 
+import types
 import socket, socketserver
 import threading
 import multiprocessing
@@ -10,7 +11,7 @@ from datetime import datetime
 
 DEFAULT_PORT = 80
 LOCAL_HOST = '127.0.0.1'
-FILE_BUFFER_SIZE = 16000 # 16KB per file size, 16000 BYTES
+FILE_BUFFER_SIZE = 16384 # 16KB per file size, 16384 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
 PEERS_TO_SHARE_WITH = 5
 TIMEOUT_FOR_PEER_DATA = 30
@@ -25,6 +26,7 @@ class Peer:
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket_event_selector = selectors.DefaultSelector()
         self.times_peers_last_sent = {}
+        self.torrent_details = torrent.Torrent()
 
     def setup_server_sock(self):
         self.server_sock.bind((LOCAL_HOST, DEFAULT_PORT))
@@ -48,7 +50,7 @@ class Peer:
         if mask & selectors.EVENT_READ:
             self.read_data(socket_connection, data)
             # TODO implement
-        self.populate_data_to_send(data)
+        # self.populate_data_to_send(data)
         if mask & selectors.EVENT_WRITE and remote_addr in self.times_peers_last_sent:
             if data.outb:
                 bytes_sent = socket_connection.send(data.outb[:TEST_FILE_BUFFER_SIZE])
@@ -67,7 +69,9 @@ class Peer:
         if data_received:
             self.times_peers_last_sent[socket_connection_address] = datetime.now()
             data.inb += data_received
+            data.inb += b"\n"
         else:
+            self.write_to_file(data.inb)
             # Unregister the connection to that client if 30 seconds has past since it last sent a packet
             time_of_last_packet = self.times_peers_last_sent[socket_connection_address]
             if (datetime.now() - time_of_last_packet).total_seconds() > TIMEOUT_FOR_PEER_DATA:
@@ -81,7 +85,11 @@ class Peer:
 
         return data
 
-    def start_peer(self):
+    def write_to_file(self, output_data):
+        print("Implement writing to file logic here")
+
+
+    def start(self):
         while True:
             events = self.socket_event_selector.select(timeout=None)
             for selector_key, event_mask in events:

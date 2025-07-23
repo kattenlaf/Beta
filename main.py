@@ -1,12 +1,17 @@
-import peer
+import peer as p
 
-
-def execute():
-    print("Program Start")
-    p = peer.Peer()
-    p.setup_server_sock()
-    p.start_peer()
-
+# example - https://github.com/gallexis/PyTorrent
 
 if __name__ == '__main__':
-    execute()
+    peer = None
+    # Setup
+    try:
+        peer = p.Peer()
+    except Exception as exc:
+        print(f"Failure using torrent parser to open torrent file with exception:{exc}")
+
+    # Run
+    peer.setup_server_sock()
+    print("Program Start")
+    peer.start()
+

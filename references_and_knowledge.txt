@@ -1,0 +1,2 @@
+references_and_knowledge.txt
+https://blog.jse.li/posts/torrent/ - building torrent client from the ground up in Go
