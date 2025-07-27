@@ -1,4 +1,7 @@
+import socket
+
 import os
+import requests
 import secrets
 import torrent_parser
 import hashlib
@@ -10,6 +13,8 @@ TORRENT_FILE_PATH_KEY = 'torrent_file_path'
 
 class Torrent:
     def __init__(self):
+        # Time to check for more peers
+        self.interval = None
         try:
             config_yaml = helpers.get_config_yaml()
             with open(config_yaml.get(TORRENT_FILE_PATH_KEY), 'rb') as f:
@@ -28,8 +33,6 @@ class Torrent:
         self.url_list = data['url-list']
         self.peerID = secrets.token_bytes(20)
         self.info_hash = hashlib.sha1(bencode(data['info'])).hexdigest()
-        print(self.info_hash)
-
         self.lookup_dict = {
             'info_hash': bytes.fromhex(self.info_hash),
             'peer_id':self.peerID,
@@ -50,3 +53,10 @@ class Torrent:
         print(self.peerID)
         for piece in self.info_pieces:
             print(piece)
+
+
+    def get_peers_from_response(self, response):
+        assert isinstance(response, requests.Response)
+        decoded = bdecode(response.content)
+        self.interval = decoded['interval']
+        return decoded['peers']
