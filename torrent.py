@@ -10,6 +10,7 @@ from bcoding import bencode, bdecode
 import helpers
 
 TORRENT_FILE_PATH_KEY = 'torrent_file_path'
+PIECES_BYTES_LENGTH = 20
 
 class Torrent:
     def __init__(self):
@@ -29,7 +30,7 @@ class Torrent:
         self.info_length = data['info']['length']
         self.info_name = data['info']['name']
         self.info_piece_length = data['info']['piece length']
-        self.info_pieces = set(data['info']['pieces'])
+        self.info_pieces = set([data['info']['pieces'][i:i+PIECES_BYTES_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_BYTES_LENGTH)])
         self.url_list = data['url-list']
         self.peerID = secrets.token_bytes(20)
         self.info_hash = hashlib.sha1(bencode(data['info'])).hexdigest()

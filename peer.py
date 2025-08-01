@@ -27,10 +27,22 @@ TIMEOUT_FOR_PEER_DATA = 30
 SOCKET_CONNECT_TIMEOUT = 10
 MAX_RETRIES_TO_CONNECT = 2
 RETRY_AFTER = 10
+# Choke related constants
+CHECK_IFCHOKED_AFTER = 10
+CHOKE_TIMEOUT = 30
 
 # Config key url parameters
 PARAMETERS = 'url_parameters'
 GET_TRACKER = 'get_tracker'
+
+# Constants for expected bytes in handshake messages
+PSTRLEN_BYTES_LEN = 1
+PSTR_BYTES_LEN = 19
+RESERVED_BYTES_LEN = 8
+INFO_HASH_BYTES_LEN = 20
+PEER_ID_BYTES_LEN = 20
+HANDSHAKE_BUF_LEN = PSTRLEN_BYTES_LEN+PSTR_BYTES_LEN+RESERVED_BYTES_LEN+INFO_HASH_BYTES_LEN+PEER_ID_BYTES_LEN
+
 
 
 # Each peer/node is both a client and a server, should have way to send file and receive
@@ -47,12 +59,45 @@ class Outside_Peer:
             return True
         return False
 
+class Handshake:
+    def __init__(self, info_hash=None, peer_id=None):
+        self.pstr = 'BitTorrent protocol'
+        self.pstrlen = len(self.pstr).to_bytes(1, byteorder='big')
+        self.reserved = bytes(8) #\x00\x00...\x00
+        self.info_hash = info_hash
+        self.peer_id = peer_id
+
+# All of the remaining messages in the protocol take the form of <length prefix><message ID><payload>.
+# The length prefix is a four byte big-endian value. The message ID is a single decimal byte.
+# The payload is message dependent.
+# Each message has:
+# Length - 32 bit integer, 4 bytes
+# ID - denoting what type of message it is, 1 byte
+# Payload - Remaining length of message
+
+LENGTH_BYTES = 4
+ID_BYTES = 1
+class Message:
+    def __init__(self, payload, messageId):
+        self.length = len(payload)
+        self.message_id = messageId
+        self.payload = payload
+        self.message = self.length.to_bytes(4, "big") + int(self.message_id).to_bytes(1, "big") + self.payload
+
+    def __init__(self, recv_data):
+        pos = 0
+        self.length, pos = int(recv_data[pos:LENGTH_BYTES]), pos+LENGTH_BYTES
+        self.message_id, pos = helpers.MessageId(int(recv_data[pos:ID_BYTES])), pos+ID_BYTES
+        self.payload = recv_data[pos:]
+        self.message = self.length.to_bytes(4, "big") + int(self.message_id).to_bytes(1, "big") + self.payload
+
 class Peer:
     def __init__(self):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket_event_selector = selectors.DefaultSelector()
         self.times_peers_last_sent = {}
         self.torrent_details = torrent.Torrent()
+        self.handshake_msg = Handshake(self.torrent_details.info_hash, self.torrent_details.peerID)
         self.check_peers_next = None
         self.other_peers_addresses = []
         self.peers_available_for_use = defaultdict(lambda: False) # peers our Peer is currently using, if value is set to True, the Peer is currently connected via a socket already
@@ -106,6 +151,7 @@ class Peer:
         return False
 
     # Following method from here https://blog.jse.li/posts/torrent/
+    # Unmarshal parses peer IP addresses and port
     def unmarshal(self, peers_from_response: bytes):
         peer_size = 6  # 4 for IP, 2 for port
         if len(peers_from_response) % peer_size != 0:
@@ -160,12 +206,16 @@ class Peer:
         peer_to_connect_to = self.select_peer_to_connect()
         if peer_to_connect_to is False:
             raise ValueError("There are no peers available to be connected to")
-        assert isinstance(peer_to_connect_to, Outside_Peer)
+        assert isinstance(Outside_Peer, peer_to_connect_to)
         retry = 0
         while retry < MAX_RETRIES_TO_CONNECT:
             try:
                 sock.connect(peer_to_connect_to.IP, peer_to_connect_to.port)
-                # complete handshake, ensure peer speaks bit torrent protocol and has the file we want
+                # initiate and complete handshake, ensure peer speaks bit torrent protocol and has the file we want
+                choked = self.initiate_complete_handshake(sock)
+                # always choked initially
+                self.check_if_still_choked(sock, choked)
+
             except TimeoutError as exc:
                 print(f"Timeout connecting to peer with ip:port, {peer_to_connect_to.IP}:{peer_to_connect_to.port}")
                 retry += 1
@@ -174,10 +224,42 @@ class Peer:
                 print(f"Unhandled Socket exception occurred exception:{exc}")
                 raise
 
-        # may need threading here to request multiple pieces at once, but for now lets focus on one peer at a time
+    def check_if_still_choked(self, sock, choked):
+        start_choke = datetime.now()
+        while choked:
+            # recv message from peer here
+            data = sock.recv(FILE_BUFFER_SIZE)
+            message = Message(data)
+            if message.message_id == helpers.MessageId.UNCHOKE:
+                choked = True
+                break
+            # parse
+            if int((start_choke - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
+                break
+            time.sleep(CHECK_IFCHOKED_AFTER)
+        if not choked:
+            print("Remove peer from list we will share with")
+            choked = False
+        else:
+            choked = True
 
 
-        # connect to a peer we have in the dictionary
+    def initiate_complete_handshake(self, sock):
+        assert isinstance(sock, socket.socket)
+        handshake = Handshake(self.torrent_details.info_hash, self.torrent_details.peerID)
+        message = helpers.get_handshake_message(handshake)
+        try:
+            # Send handshake message, wait for response
+            sock.sendall(message)
+            data = sock.recv(HANDSHAKE_BUF_LEN)
+            if len(data) != HANDSHAKE_BUF_LEN:
+                raise ValueError('peer sent malformed handshake message')
+            else:
+                peer_handshake = Handshake()
+                peer_handshake = helpers.set_handshake_from_message(peer_handshake, data)
+        except Exception as exc:
+            print(f'unhandled exception occurred initiating handshake with peer: {exc}')
+            raise
 
     def select_peer_to_connect(self):
         for peer in self.peers_available_for_use.keys():
@@ -186,8 +268,7 @@ class Peer:
 
         return False
 
-    # TODO: Implement method to periodically chekc and remove peers we get no packets from?
-
+    # TODO: Implement method to periodically check and remove peers we get no packets from?
 
     def populate_data_to_send(self, data):
         # Solution to find what bytes/file chunk to send here
