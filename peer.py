@@ -79,6 +79,7 @@ LENGTH_BYTES = 4
 ID_BYTES = 1
 class Message:
     def __init__(self, payload, messageId):
+        # length here should probably be different, maybe misunderstood documentation?
         self.length = len(payload)
         self.message_id = messageId
         self.payload = payload
@@ -90,6 +91,14 @@ class Message:
         self.message_id, pos = helpers.MessageId(int(recv_data[pos:ID_BYTES])), pos+ID_BYTES
         self.payload = recv_data[pos:]
         self.message = self.length.to_bytes(4, "big") + int(self.message_id).to_bytes(1, "big") + self.payload
+
+class Piece:
+    def __init__(self):
+        self.index = 0
+        self.buffer = bytearray(256)
+        self.downloaded = 0
+        self.requested = 0
+        self.backlog = 0
 
 class Peer:
     def __init__(self):
@@ -166,7 +175,6 @@ class Peer:
             # > for big endian, H for unsigned short int
             port = struct.unpack(">H", port_bytes)[0]
             peers.append(Outside_Peer(ip, port))
-
         return peers
 
     def accept_connections(self, server_sock):
@@ -212,9 +220,21 @@ class Peer:
             try:
                 sock.connect(peer_to_connect_to.IP, peer_to_connect_to.port)
                 # initiate and complete handshake, ensure peer speaks bit torrent protocol and has the file we want
-                choked = self.initiate_complete_handshake(sock)
                 # always choked initially
-                self.check_if_still_choked(sock, choked)
+                choked = self.initiate_complete_handshake(sock)
+                if not choked:
+                    # this means for some reason the handshake didn't succeed if we are not choked
+                    # remove the peer and return so we will try another peer later?
+                    return
+                # if handshake succeeded we are sharing with peer, we want to only stop sharing if we have been choked
+                # for 30 seconds consecutively as such we will not share with them anymore
+                sharing_with_peer = True
+                while sharing_with_peer:
+                    # keep sharing until they don't share with us for some time
+                    sharing_with_peer = self.check_if_still_choked(sock, choked)
+                    # make a request for a piece
+                    # then download the piece if received
+
 
             except TimeoutError as exc:
                 print(f"Timeout connecting to peer with ip:port, {peer_to_connect_to.IP}:{peer_to_connect_to.port}")
@@ -224,39 +244,67 @@ class Peer:
                 print(f"Unhandled Socket exception occurred exception:{exc}")
                 raise
 
+    # request: <len=0013><id=6><index><begin><length>
+    def build_request_piece_message(self, index, begin, length):
+        # Complete tmr
+        message = Message(payload, messageId)
+
+
+    # maybe rename method, may not always just be checking if choked here. any message could be sent
     def check_if_still_choked(self, sock, choked):
-        start_choke = datetime.now()
+        choke_started = datetime.now()
         while choked:
             # recv message from peer here
+            # perhaps may need to do other indepth checks on the message, we may be choked but they could request a file
+            # or send some other message
             data = sock.recv(FILE_BUFFER_SIZE)
             message = Message(data)
-            if message.message_id == helpers.MessageId.UNCHOKE:
-                choked = True
-                break
-            # parse
-            if int((start_choke - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
+            choked = self.handle_message_received(message)
+            if int((choke_started - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
                 break
             time.sleep(CHECK_IFCHOKED_AFTER)
-        if not choked:
+        if choked:
             print("Remove peer from list we will share with")
-            choked = False
-        else:
-            choked = True
+        return choked
 
+    # https://wiki.theory.org/BitTorrentSpecification - Messages
+    def handle_message_received(self, message: Message):
+        if message.message_id == helpers.MessageId.UNCHOKE:
+            return True
+        if message.message_id == helpers.MessageId.HAVE:
+            # should length be divided by 8 for bytes?
+            piece_index = message.payload[5:message.length]
+            return piece_index
+        if message.message_id == helpers.MessageId.PIECE:
+            if not self.write_block_to_piece(message):
+                raise IOError("Error writing payload received to block")
+            return
+
+        return False
+
+    def write_block_to_piece(self, message: Message):
+        # piece: <len=0009+X><id=7><index><begin><block>
+        # TODO clean up magic numbers for this
+        block_length = message.length - 9
+        index = int(message.payload[6])
+        begin = int(message.payload[7])
+        block = message.payload[8:]
+
+        return True
 
     def initiate_complete_handshake(self, sock):
         assert isinstance(sock, socket.socket)
         handshake = Handshake(self.torrent_details.info_hash, self.torrent_details.peerID)
         message = helpers.get_handshake_message(handshake)
         try:
-            # Send handshake message, wait for response
             sock.sendall(message)
             data = sock.recv(HANDSHAKE_BUF_LEN)
             if len(data) != HANDSHAKE_BUF_LEN:
                 raise ValueError('peer sent malformed handshake message')
             else:
                 peer_handshake = Handshake()
-                peer_handshake = helpers.set_handshake_from_message(peer_handshake, data)
+                helpers.set_handshake_from_message(peer_handshake, data)
+                return peer_handshake.peer_id != None
         except Exception as exc:
             print(f'unhandled exception occurred initiating handshake with peer: {exc}')
             raise

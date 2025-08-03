@@ -16,6 +16,11 @@ class MessageId(Enum):
     PIECE = 7
     CANCEL = 8
 
+class Pieces_Download_State(Enum):
+    NOT_STARTED = 0
+    IN_PROGRESS = 1
+    COMPLETED = 2
+
 # https://www.youtube.com/watch?v=9Z2U3HF3iD4&ab_channel=RDCLive
 # handshake: <pstrlen><pstr><reserved><info_hash><peer_id> - https://wiki.theory.org/BitTorrentSpecification
 def get_handshake_message(handshake):

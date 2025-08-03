@@ -1,12 +1,10 @@
 import socket
-
 import os
 import requests
 import secrets
 import torrent_parser
 import hashlib
 from bcoding import bencode, bdecode
-
 import helpers
 
 TORRENT_FILE_PATH_KEY = 'torrent_file_path'
@@ -31,6 +29,9 @@ class Torrent:
         self.info_name = data['info']['name']
         self.info_piece_length = data['info']['piece length']
         self.info_pieces = set([data['info']['pieces'][i:i+PIECES_BYTES_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_BYTES_LENGTH)])
+        self.info_pieces_state = defaultdict(int)
+        for piece_hash in self.info_pieces:
+            self.info_pieces_state.add(piece_hash)
         self.url_list = data['url-list']
         self.peerID = secrets.token_bytes(20)
         self.info_hash = hashlib.sha1(bencode(data['info'])).hexdigest()
@@ -54,7 +55,7 @@ class Torrent:
         print(self.peerID)
         for piece in self.info_pieces:
             print(piece)
-
+        print(self.info_pieces_state)
 
     def get_peers_from_response(self, response):
         assert isinstance(response, requests.Response)
