@@ -28,6 +28,7 @@ class Torrent:
         self.info_length = data['info']['length']
         self.info_name = data['info']['name']
         self.info_piece_length = data['info']['piece length']
+        self.info_pieces_list = list([data['info']['pieces'][i:i+PIECES_BYTES_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_BYTES_LENGTH)])
         self.info_pieces = set([data['info']['pieces'][i:i+PIECES_BYTES_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_BYTES_LENGTH)])
         self.info_pieces_state = defaultdict(int)
         for piece_hash in self.info_pieces:

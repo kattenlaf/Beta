@@ -15,12 +15,14 @@ import urllib
 import requests
 import struct
 from collections import defaultdict
+import random
 
 # https://docs.python.org/3/library/socket.html
 
 DEFAULT_PORT = 80
 LOCAL_HOST = '127.0.0.1'
-FILE_BUFFER_SIZE = 16384 # 16KB per file size, 16384 BYTES
+BLOCK_BUFFER_SIZE = 16000 # 16KB per block size, 16384 BYTES
+PIECE_BUFFER_SIZE = 256000 # 256KB per piece size, 256000 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
 MAX_PEERS_TO_SHARE_WITH = 5
 TIMEOUT_FOR_PEER_DATA = 30
@@ -89,16 +91,45 @@ class Message:
         pos = 0
         self.length, pos = int(recv_data[pos:LENGTH_BYTES]), pos+LENGTH_BYTES
         self.message_id, pos = helpers.MessageId(int(recv_data[pos:ID_BYTES])), pos+ID_BYTES
-        self.payload = recv_data[pos:]
+        self.payload = recv_data[pos:pos+self.length]
         self.message = self.length.to_bytes(4, "big") + int(self.message_id).to_bytes(1, "big") + self.payload
 
+# <index><begin><block>
+class Block:
+    def __init__(self, payload):
+        # first integer for index 4 bytes
+        self.index = int(payload[0:4])
+        # second integer for byte offset within the piece
+        self.begin = int(payload[4:8])
+        # rest is for the block of data
+        self.data_block = payload[8:]
+
 class Piece:
-    def __init__(self):
-        self.index = 0
-        self.buffer = bytearray(256)
+    def __init__(self, piece_hash, index=0):
+        self.index = index
+        self.buffer = bytearray(PIECE_BUFFER_SIZE)
         self.downloaded = 0
         self.requested = 0
         self.backlog = 0
+        self.piece_hash = piece_hash
+
+    def place_block_in_buffer(self, block: Block):
+        index = block.index
+        # TODO, place block in buffer
+        if self.downloaded == len(self.buffer):
+            return False
+        try:
+            self.buffer[index:len(block.data_block)] = block.data_block
+        except IndexError as exc:
+            print(f'Exception placing block in the piece byte array')
+
+    def write_piece_to_file(self):
+        # TODO write the piece to memory if fully downloaded?
+        return True
+
+    def is_finished_downloading(self):
+        # TODO implement
+        return True
 
 class Peer:
     def __init__(self):
@@ -112,6 +143,17 @@ class Peer:
         self.peers_available_for_use = defaultdict(lambda: False) # peers our Peer is currently using, if value is set to True, the Peer is currently connected via a socket already
         self.current_peers_available_for_use_pos = 0
         self.downloaded_pieces = set()
+        self.bitfield = bytearray()
+
+    def has_piece(self, index):
+        byte_index = index / 8
+        offset = index % 8
+        return self.bitfield[byte_index]>>(7-offset)&1 != 0
+
+    def set_piece(self, index):
+        byte_index = index / 8
+        offset = index % 8
+        self.bitfield[byte_index] |= 1 << (7-offset)
 
     def setup_server_sock(self):
         self.server_sock.bind((LOCAL_HOST, DEFAULT_PORT))
@@ -232,8 +274,18 @@ class Peer:
                 while sharing_with_peer:
                     # keep sharing until they don't share with us for some time
                     sharing_with_peer = self.check_if_still_choked(sock, choked)
-                    # make a request for a piece
-                    # then download the piece if received
+                    # check that they have a piece we can get first
+                    piece = self.choose_piece_to_download()
+                    while not piece.is_finished_downloading():
+                        # request: <len=0013><id=6><index><begin><length>
+                        piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST, helpers.MessageId.REQUEST, piece, piece.index, BLOCK_BUFFER_SIZE)
+                        sock.sendall(piece_request)
+                        message = ensure_peer_responds(sock)
+                        if message != False:
+                            if message.message_id == helpers.MessageId.PIECE:
+                                data_block = Block(message.payload)
+                                piece.place_block_in_buffer(data_block)
+                                # TODO continue tomorrow
 
 
             except TimeoutError as exc:
@@ -244,10 +296,32 @@ class Peer:
                 print(f"Unhandled Socket exception occurred exception:{exc}")
                 raise
 
-    # request: <len=0013><id=6><index><begin><length>
-    def build_request_piece_message(self, index, begin, length):
-        # Complete tmr
-        message = Message(payload, messageId)
+    def ensure_peer_responds(self, sock: socket.socket):
+        start_request = datetime.now()
+        while True:
+            data = sock.recv(BLOCK_BUFFER_SIZE)
+            if data:
+                message = Message(data)
+                if message.message_id == helpers.MessageId.HAVE:
+                    return message
+                if message.message_id == helpers.MessageId.PIECE:
+                    # Piece was returned
+                    return message
+                if message.message_id == helpers.MessageId.CHOKE:
+                    if int((start_request - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
+                        return False
+                if message.message_id == helpers.MessageId.UNCHOKE:
+                    start_request = datetime.now()
+            else:
+                if int((start_request - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
+                    return False
+
+
+    def choose_piece_to_download(self) -> Piece:
+        num_pieces = len(self.torrent_details.info_pieces_list)
+        rand_int = random.random(0, num_pieces)
+        piece = Piece(self.torrent_details.info_pieces[rand_int], rand_int)
+        return piece
 
 
     # maybe rename method, may not always just be checking if choked here. any message could be sent
@@ -257,7 +331,7 @@ class Peer:
             # recv message from peer here
             # perhaps may need to do other indepth checks on the message, we may be choked but they could request a file
             # or send some other message
-            data = sock.recv(FILE_BUFFER_SIZE)
+            data = sock.recv(BLOCK_BUFFER_SIZE)
             message = Message(data)
             choked = self.handle_message_received(message)
             if int((choke_started - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
@@ -266,6 +340,16 @@ class Peer:
         if choked:
             print("Remove peer from list we will share with")
         return choked
+
+    def construct_message_to_send(self, messagelen: int, messageId: helpers.MessageId, piece: Piece, messageBegin: int, messageLength: int):
+        payload = (messagelen.to_bytes(4, "big") +
+                   int(helpers.MessageId).to_bytes() +
+                   piece.index.to_bytes(4, "big") +
+                   messageBegin.to_bytes(4, "big") +
+                   messageLength.to_bytes(4, "big"))
+
+        return payload
+
 
     # https://wiki.theory.org/BitTorrentSpecification - Messages
     def handle_message_received(self, message: Message):
@@ -278,7 +362,7 @@ class Peer:
         if message.message_id == helpers.MessageId.PIECE:
             if not self.write_block_to_piece(message):
                 raise IOError("Error writing payload received to block")
-            return
+            return True
 
         return False
 
@@ -316,34 +400,30 @@ class Peer:
 
         return False
 
-    # TODO: Implement method to periodically check and remove peers we get no packets from?
-
     def populate_data_to_send(self, data):
         # Solution to find what bytes/file chunk to send here
         data.outb = b"Hello from server"
 
-    def read_data(self, socket_connection, data):
-        data_received = socket_connection.recv(TEST_FILE_BUFFER_SIZE)
-        data_received = self.format_data(data_received, selectors.EVENT_READ)
-        socket_connection_address = socket_connection.getpeername()
+    def read_data_for_piece(self, sock, piece: Piece):
+        data_received = sock.recv(BLOCK_BUFFER_SIZE)
+        message = Message(data_received)
+        self.handle_message_received(message)
+
+
+
+        sock_address = sock.getpeername()
         if data_received:
-            self.times_peers_last_sent[socket_connection_address] = datetime.now()
+            self.times_peers_last_sent[sock_address] = datetime.now()
             data.inb += data_received
             data.inb += b"\n"
         else:
             self.write_to_file(data)
             # Unregister the connection to that client if 30 seconds has past since it last sent a packet
-            time_of_last_packet = self.times_peers_last_sent[socket_connection_address]
+            time_of_last_packet = self.times_peers_last_sent[sock_address]
             if (datetime.now() - time_of_last_packet).total_seconds() > TIMEOUT_FOR_PEER_DATA:
-                self.socket_event_selector.unregister(socket_connection)
-                self.times_peers_last_sent.pop(socket_connection_address)
-                socket_connection.close()
-
-    def format_data(self, data, type):
-        if type == selectors.EVENT_READ:
-            data = data.rstrip()
-
-        return data
+                self.socket_event_selector.unregister(sock)
+                self.times_peers_last_sent.pop(sock_address)
+                sock.close()
 
     def write_to_file(self, data):
         print("Implement writing to file logic here")
@@ -351,9 +431,6 @@ class Peer:
         data.inb = b""
         # Implement writing the
         print(f"received {received_data} from peer")
-
-
-
 
     def start(self):
         ping_tracker_for_info = True
