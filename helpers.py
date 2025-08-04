@@ -5,6 +5,13 @@ from enum import Enum
 CONFIG_FILE_PATH = 'config.yaml'
 PORT = 80
 
+class MessageLength(Enum):
+    BITFIELD = 1 # 1 + X
+    HAVE = 5
+    REQUEST = 13
+    PIECE = 9 # 9 + X
+    CANCEL = 13
+
 class MessageId(Enum):
     CHOKE = 0
     UNCHOKE = 1
