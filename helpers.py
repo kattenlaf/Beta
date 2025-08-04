@@ -7,9 +7,13 @@ PORT = 80
 
 class MessageLength(Enum):
     BITFIELD = 1 # 1 + X
+    UNCHOKE = 1
+    CHOKE = 1
+    INTERESTED = 1
+    UNINTERESTED = 1
     HAVE = 5
+    PIECE = 9  # 9 + X
     REQUEST = 13
-    PIECE = 9 # 9 + X
     CANCEL = 13
 
 class MessageId(Enum):

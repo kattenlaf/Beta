@@ -16,6 +16,7 @@ import requests
 import struct
 from collections import defaultdict
 import random
+from queue import Queue
 
 # https://docs.python.org/3/library/socket.html
 
@@ -24,7 +25,7 @@ LOCAL_HOST = '127.0.0.1'
 BLOCK_BUFFER_SIZE = 16000 # 16KB per block size, 16384 BYTES
 PIECE_BUFFER_SIZE = 256000 # 256KB per piece size, 256000 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
-MAX_PEERS_TO_SHARE_WITH = 5
+MAX_PEERS_TO_SHARE_WITH = 10
 TIMEOUT_FOR_PEER_DATA = 30
 SOCKET_CONNECT_TIMEOUT = 10
 MAX_RETRIES_TO_CONNECT = 2
@@ -45,21 +46,45 @@ INFO_HASH_BYTES_LEN = 20
 PEER_ID_BYTES_LEN = 20
 HANDSHAKE_BUF_LEN = PSTRLEN_BYTES_LEN+PSTR_BYTES_LEN+RESERVED_BYTES_LEN+INFO_HASH_BYTES_LEN+PEER_ID_BYTES_LEN
 
+# Bitfield expected Length
+BITFIELD_LENGTH = 8 # 8 bytes
+MAXBACKLOG = 5
 
 
 # Each peer/node is both a client and a server, should have way to send file and receive
 # https://stackoverflow.com/questions/70962218/understanding-the-requisites-that-allow-bittorrent-peers-to-connect-to-each-othe
 # https://docs.python.org/3/howto/sockets.html
 
+class Bitfield:
+    def __init__(self, received_bitfield=None):
+        self.bitfield = bytearray()
+        if received_bitfield is not None:
+            self.bitfield = received_bitfield
+
+    def has_piece(self, index):
+        byte_index = index / 8
+        offset = index % 8
+        return self.bitfield[byte_index]>>(7-offset)&1 != 0
+
+    def set_piece(self, index):
+        byte_index = index / 8
+        offset = index % 8
+        self.bitfield[byte_index] |= 1 << (7-offset)
+
 class Outside_Peer:
     def __init__(self, IP=None, port=None):
         self.IP = IP
         self.port = port
+        self.bitfield = Bitfield()
 
     def __eq__(self, other):
         if self.IP == other.IP and self.port == other.port:
             return True
         return False
+
+    def set_bitfield(self, message: Message):
+        bitfield_length = message.length - 0x0001
+        self.bitfield = bytearray(bitfield_length)
 
 class Handshake:
     def __init__(self, info_hash=None, peer_id=None):
@@ -80,19 +105,27 @@ class Handshake:
 LENGTH_BYTES = 4
 ID_BYTES = 1
 class Message:
-    def __init__(self, payload, messageId):
+    def __init__(self, length, messageId, payload):
         # length here should probably be different, maybe misunderstood documentation?
-        self.length = len(payload)
+        self.length = length
         self.message_id = messageId
         self.payload = payload
         self.message = self.length.to_bytes(4, "big") + int(self.message_id).to_bytes(1, "big") + self.payload
 
     def __init__(self, recv_data):
+        if recv_data is None or len(recv_data) <= 0:
+            return None
         pos = 0
         self.length, pos = int(recv_data[pos:LENGTH_BYTES]), pos+LENGTH_BYTES
         self.message_id, pos = helpers.MessageId(int(recv_data[pos:ID_BYTES])), pos+ID_BYTES
         self.payload = recv_data[pos:pos+self.length]
         self.message = self.length.to_bytes(4, "big") + int(self.message_id).to_bytes(1, "big") + self.payload
+
+    def parse_piece_index_from_message(self):
+        if self.message_id == helpers.MessageId.HAVE:
+            return int(self.payload)
+
+    def parse_piece_from_message(self):
 
 # <index><begin><block>
 class Block:
@@ -105,13 +138,18 @@ class Block:
         self.data_block = payload[8:]
 
 class Piece:
-    def __init__(self, piece_hash, index=0):
+    def __init__(self, piece_hash, index, torrent_piece_length, torrent_final_buf_length):
         self.index = index
-        self.buffer = bytearray(PIECE_BUFFER_SIZE)
-        self.downloaded = 0
-        self.requested = 0
-        self.backlog = 0
+        # Where does this piece begin and end in the final buffer of the whole file
+        self.begin = index * torrent_piece_length
+        end_ = self.begin + torrent_piece_length
+        self.end = end_ if end_ < torrent_final_buf_length else torrent_final_buf_length
+        self.piece_length = self.end - self.begin
+        self.buffer = bytearray(self.piece_length)
         self.piece_hash = piece_hash
+        self.downloaded = 0 # blocks downloaded
+        self.requested = 0 # blocks requested?
+        self.backlog = 0 # idk
 
     def place_block_in_buffer(self, block: Block):
         index = block.index
@@ -120,16 +158,16 @@ class Piece:
             return False
         try:
             self.buffer[index:len(block.data_block)] = block.data_block
+            self.downloaded += len(block.data_block)
         except IndexError as exc:
             print(f'Exception placing block in the piece byte array')
 
-    def write_piece_to_file(self):
-        # TODO write the piece to memory if fully downloaded?
-        return True
+    def isdownloading(self):
+        return self.downloaded < self.piece_length
 
-    def is_finished_downloading(self):
-        # TODO implement
-        return True
+    def place_piece_in_final_buffer(self, file_buffer: bytearray):
+        if self.is_piece_downloaded():
+            file_buffer[self.begin:self.end] = self.buffer
 
 class Peer:
     def __init__(self):
@@ -142,18 +180,16 @@ class Peer:
         self.other_peers_addresses = []
         self.peers_available_for_use = defaultdict(lambda: False) # peers our Peer is currently using, if value is set to True, the Peer is currently connected via a socket already
         self.current_peers_available_for_use_pos = 0
-        self.downloaded_pieces = set()
-        self.bitfield = bytearray()
+        self.number_pieces_to_download = len(self.torrent_details.info_pieces_list)
+        self.pieces_to_download_queue = Queue(maxsize=self.number_pieces_to_download)
+        self.bitfield = Bitfield()
+        self.finished_buffer = bytearray(self.torrent_details.info_length) # where we will write all the pieces we download to
 
-    def has_piece(self, index):
-        byte_index = index / 8
-        offset = index % 8
-        return self.bitfield[byte_index]>>(7-offset)&1 != 0
-
-    def set_piece(self, index):
-        byte_index = index / 8
-        offset = index % 8
-        self.bitfield[byte_index] |= 1 << (7-offset)
+    def init_pieces_to_download(self):
+        for i in range(self.number_pieces_to_download):
+            piece_hash = self.torrent_details.info_pieces_list[i]
+            piece = Piece(piece_hash, i, self.torrent_details.info_piece_length, self.torrent_details.info_length)
+            self.pieces_to_download_queue.put(piece)
 
     def setup_server_sock(self):
         self.server_sock.bind((LOCAL_HOST, DEFAULT_PORT))
@@ -177,6 +213,7 @@ class Peer:
             except Exception as e:
                 print(f'Unhandled exception when making request to tracker: {e}')
 
+    # Selects a set of Outside_Peer objects with their ips and ports to connect to
     def set_connected_peers(self):
         num_of_peers_to_add = MAX_PEERS_TO_SHARE_WITH - len(self.peers_available_for_use)
         for i in range(self.current_peers_available_for_use_pos, self.current_peers_available_for_use_pos + num_of_peers_to_add):
@@ -185,7 +222,7 @@ class Peer:
             if i < len(self.other_peers_addresses):
                 peer_to_add = self.other_peers_addresses[i]
                 if peer_to_add not in self.peers_available_for_use:
-                    self.peers_available_for_use[peer_to_add] = False
+                    self.peers_available_for_use[peer_to_add] = True
                     self.current_peers_available_for_use_pos += 1
 
     def get_parameters_for_requests(self, url_parameter_node, request_type):
@@ -244,6 +281,23 @@ class Peer:
                 print(f'Sent to client\n{data.outb[:bytes_sent]}')
                 data.outb = data.outb[bytes_sent:]
 
+    def receive_bitfield(self, sock: socket.socket):
+        sock.settimeout(10)
+        message = Message(sock.recv(BLOCK_BUFFER_SIZE))
+        if message is None or message.message_id != helpers.MessageId.BITFIELD:
+            return None
+        else:
+            return message # should be bitfield that the peer has
+
+    # Key messages to send to peer for downloading / uploading piece
+    def send_unchoke_message(self, sock: socket.socket):
+        message = Message(helpers.MessageLength.UNCHOKE, helpers.MessageId.UNCHOKE, b'')
+        sock.sendall(message.message)
+
+    def send_interested_message(self, sock: socket.socket):
+        message = Message(helpers.MessageLength.INTERESTED, helpers.MessageId.INTERESTED, b'')
+        sock.sendall(message.message)
+
     def request_piece_from_peer(self):
         # To implement, set up TCP connection with a peer I have
         # Request the piece
@@ -254,104 +308,136 @@ class Peer:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10)
         peer_to_connect_to = self.select_peer_to_connect()
-        if peer_to_connect_to is False:
+        if peer_to_connect_to is None or peer_to_connect_to is False:
             raise ValueError("There are no peers available to be connected to")
-        assert isinstance(Outside_Peer, peer_to_connect_to)
         retry = 0
         while retry < MAX_RETRIES_TO_CONNECT:
             try:
                 sock.connect(peer_to_connect_to.IP, peer_to_connect_to.port)
                 # initiate and complete handshake, ensure peer speaks bit torrent protocol and has the file we want
                 # always choked initially
-                choked = self.initiate_complete_handshake(sock)
-                if not choked:
-                    # this means for some reason the handshake didn't succeed if we are not choked
-                    # remove the peer and return so we will try another peer later?
-                    return
+                choked = self.initiate_complete_handshake(sock) # Always True initially
+                # receive bitfield from peer, showing the pieces that the peer has that we can request
+                peer_to_connect_to.set_bitfield(self.receive_bitfield(sock))
+                self.send_unchoke_message(sock)
+                self.send_interested_message(sock)
                 # if handshake succeeded we are sharing with peer, we want to only stop sharing if we have been choked
                 # for 30 seconds consecutively as such we will not share with them anymore
                 sharing_with_peer = True
                 while sharing_with_peer:
-                    # keep sharing until they don't share with us for some time
-                    sharing_with_peer = self.check_if_still_choked(sock, choked)
-                    # check that they have a piece we can get first
-                    piece = self.choose_piece_to_download()
-                    while not piece.is_finished_downloading():
-                        # request: <len=0013><id=6><index><begin><length>
-                        piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST, helpers.MessageId.REQUEST, piece, piece.index, BLOCK_BUFFER_SIZE)
-                        sock.sendall(piece_request)
-                        message = ensure_peer_responds(sock)
-                        if message != False:
-                            if message.message_id == helpers.MessageId.PIECE:
-                                data_block = Block(message.payload)
-                                piece.place_block_in_buffer(data_block)
-                                # TODO continue tomorrow
+                    sharing_with_peer = not self.is_choked(sock, choked) # Check if choked for more than 30 seconds
+                    if not sharing_with_peer:
+                        break
+                    piece = self.choose_piece_to_download(peer_to_connect_to.bitfield)
+                    if piece is None: # peer does not have a piece we want
+                        sharing_with_peer = False
+                    while sharing_with_peer and piece.isdownloading():
+                        if not choked:
+                            # request: <len=0013><id=6><index><begin><length>
+                            piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST, helpers.MessageId.REQUEST, piece, piece.index, BLOCK_BUFFER_SIZE)
+                            sock.sendall(piece_request)
+                            self.download_piece(sock, piece)
 
+                            message = self.ensure_peer_responds(sock)
+                            if message != False:
+                                if message.message_id == helpers.MessageId.PIECE:
+                                    data_block = Block(message.payload)
+                                    piece.place_block_in_buffer(data_block)
+                if sharing_with_peer == False:
+                    self.remove_peer_to_connect_to(peer_to_connect_to)
 
             except TimeoutError as exc:
                 print(f"Timeout connecting to peer with ip:port, {peer_to_connect_to.IP}:{peer_to_connect_to.port}")
                 retry += 1
                 time.sleep(RETRY_AFTER)
             except socket.error as exc:
-                print(f"Unhandled Socket exception occurred exception:{exc}")
+                print(f"Unhandled Socket exception occurred during requesting piece from peer:{exc}")
+                raise
+            except Exception as exc:
+                print(f"Unhandled Exception occurred")
                 raise
 
-    def ensure_peer_responds(self, sock: socket.socket):
+    def download_piece(self, sock: socket.socket, piece_downloading: Piece):
+        start_downloading = datetime.now()
+        while piece_downloading.backlog < MAXBACKLOG and piece_downloading.requested < piece_downloading.piece_length:
+            block_size = BLOCK_BUFFER_SIZE
+            remaining_piece = piece_downloading.piece_length - piece_downloading.requested
+            if remaining_piece < BLOCK_BUFFER_SIZE:
+                block_size = remaining_piece
+            # request: <len=0013><id=6><index><begin><length>
+            piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST,
+                                                           helpers.MessageId.REQUEST, piece,
+                                                           piece.index, block_size)
+            sock.sendall(piece_request)
+            piece_downloading.backlog += 1
+            piece_downloading.requested += block_size
+
+        # Read from the socket
+        # Parse the message, if it is a piece message parse it and place it in the piece, decrease backlog by 1, increase downloaded by size of block
+
+
+    def read_message(self, sock: socket.socket, piece_downloading: Piece, peer_connected: Outside_Peer):
         start_request = datetime.now()
-        while True:
-            data = sock.recv(BLOCK_BUFFER_SIZE)
-            if data:
-                message = Message(data)
-                if message.message_id == helpers.MessageId.HAVE:
-                    return message
-                if message.message_id == helpers.MessageId.PIECE:
-                    # Piece was returned
-                    return message
-                if message.message_id == helpers.MessageId.CHOKE:
-                    if int((start_request - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
-                        return False
-                if message.message_id == helpers.MessageId.UNCHOKE:
-                    start_request = datetime.now()
-            else:
+        data = sock.recv(BLOCK_BUFFER_SIZE)
+        if data:
+            message = Message(data)
+            if message.message_id == helpers.MessageId.HAVE:
+                piece_index = message.parse_piece_index_from_message()
+                peer_connected.bitfield.set_piece(piece_index)
+            if message.message_id == helpers.MessageId.PIECE:
+                # CONTINUE HERE
+                block = message.parse_piece_from_message()
+                piece_downloading.
+            if message.message_id == helpers.MessageId.CHOKE:
                 if int((start_request - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
                     return False
+            if message.message_id == helpers.MessageId.UNCHOKE:
+                start_request = datetime.now()
+        else:
+            if int((start_request - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
+                return False
 
 
-    def choose_piece_to_download(self) -> Piece:
-        num_pieces = len(self.torrent_details.info_pieces_list)
-        rand_int = random.random(0, num_pieces)
-        piece = Piece(self.torrent_details.info_pieces[rand_int], rand_int)
+    def choose_piece_to_download(self, peer_bitfield: Bitfield) -> Piece:
+        # Choose pieces based on what is pulled off the queue and what the peer bitfield possesses
+        piece = None
+        for i in range(len(self.pieces_to_download_queue)):
+            current_piece = Piece(self.pieces_to_download_queue.get())
+            if peer_bitfield.has_piece(current_piece.index):
+                piece = current_piece
+                break
+            else:
+                # put back on queue
+                self.pieces_to_download_queue.put(current_piece)
+
         return piece
 
 
-    # maybe rename method, may not always just be checking if choked here. any message could be sent
-    def check_if_still_choked(self, sock, choked):
+    # Have we been choked for more than 30 seconds without receiving an unchoke message
+    def is_choked(self, sock, choked):
         choke_started = datetime.now()
         while choked:
-            # recv message from peer here
-            # perhaps may need to do other indepth checks on the message, we may be choked but they could request a file
-            # or send some other message
             data = sock.recv(BLOCK_BUFFER_SIZE)
             message = Message(data)
-            choked = self.handle_message_received(message)
+            if message.message_id == helpers.MessageId.UNCHOKE:
+                choked = False
+                break
             if int((choke_started - datetime.now()).total_seconds()) > CHOKE_TIMEOUT:
                 break
             time.sleep(CHECK_IFCHOKED_AFTER)
-        if choked:
-            print("Remove peer from list we will share with")
         return choked
 
     def construct_message_to_send(self, messagelen: int, messageId: helpers.MessageId, piece: Piece, messageBegin: int, messageLength: int):
-        payload = (messagelen.to_bytes(4, "big") +
+        message_to_send = (messagelen.to_bytes(4, "big") +
                    int(helpers.MessageId).to_bytes() +
                    piece.index.to_bytes(4, "big") +
                    messageBegin.to_bytes(4, "big") +
                    messageLength.to_bytes(4, "big"))
 
-        return payload
+        return message_to_send
 
 
-    # https://wiki.theory.org/BitTorrentSpecification - Messages
+    # https://wiki.theory.org/BitTorrentSpecification - Messages # TODO CHANGE THIS / REMOVE
     def handle_message_received(self, message: Message):
         if message.message_id == helpers.MessageId.UNCHOKE:
             return True
@@ -379,26 +465,32 @@ class Peer:
     def initiate_complete_handshake(self, sock):
         assert isinstance(sock, socket.socket)
         handshake = Handshake(self.torrent_details.info_hash, self.torrent_details.peerID)
-        message = helpers.get_handshake_message(handshake)
+        handshake_msg = helpers.get_handshake_message(handshake)
         try:
-            sock.sendall(message)
+            sock.sendall(handshake_msg)
             data = sock.recv(HANDSHAKE_BUF_LEN)
-            if len(data) != HANDSHAKE_BUF_LEN:
-                raise ValueError('peer sent malformed handshake message')
+            peer_handshake = Handshake()
+            helpers.set_handshake_from_message(peer_handshake, data)
+            if peer_handshake.info_hash != self.torrent_details.info_hash:
+                raise ValueError('expected infohash from peer but got something else')
             else:
-                peer_handshake = Handshake()
-                helpers.set_handshake_from_message(peer_handshake, data)
-                return peer_handshake.peer_id != None
+                return True  # maybe need peerid to track how long since last download
         except Exception as exc:
             print(f'unhandled exception occurred initiating handshake with peer: {exc}')
+            sock.close()
             raise
 
-    def select_peer_to_connect(self):
+    # returns peer
+    def select_peer_to_connect(self) -> Outside_Peer:
+        # maybe change to peers available to download from
         for peer in self.peers_available_for_use.keys():
             if self.peers_available_for_use[peer] != False:
                 return peer
 
         return False
+
+    def remove_peer_to_connect_to(self, connected_peer: Outside_Peer):
+        del self.peers_available_for_use[Outside_Peer] # may not work if python still things this key is unhashable, fix
 
     def populate_data_to_send(self, data):
         # Solution to find what bytes/file chunk to send here
@@ -408,9 +500,6 @@ class Peer:
         data_received = sock.recv(BLOCK_BUFFER_SIZE)
         message = Message(data_received)
         self.handle_message_received(message)
-
-
-
         sock_address = sock.getpeername()
         if data_received:
             self.times_peers_last_sent[sock_address] = datetime.now()
