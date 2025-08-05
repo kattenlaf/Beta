@@ -35,7 +35,6 @@ class Pieces_Download_State(Enum):
 # https://www.youtube.com/watch?v=9Z2U3HF3iD4&ab_channel=RDCLive
 # handshake: <pstrlen><pstr><reserved><info_hash><peer_id> - https://wiki.theory.org/BitTorrentSpecification
 def get_handshake_message(handshake):
-    assert isinstance(handshake, Handshake)
     handshake_msg = bytearray(len(handshake.pstr) + 49)
     pos = 0
     handshake_msg[pos:], pos = handshake.pstrlen, pos + len(handshake.pstrlen)
@@ -48,7 +47,6 @@ def get_handshake_message(handshake):
 
 # Method to parse
 def set_handshake_from_message(handshake, message):
-    assert isinstance(handshake, Handshake)
     pos = 0
     handshake.pstrlen, pos = message[pos:pos+PSTRLEN_BYTES_LEN], pos+PSTRLEN_BYTES_LEN
     handshake.pstr, pos = message[pos:pos+PSTR_BYTES_LEN], pos+PSTR_BYTES_LEN
