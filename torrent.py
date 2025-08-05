@@ -8,12 +8,13 @@ from bcoding import bencode, bdecode
 import helpers
 
 TORRENT_FILE_PATH_KEY = 'torrent_file_path'
-PIECES_BYTES_LENGTH = 20
+PIECES_HASH_LENGTH = 20
 
 class Torrent:
     def __init__(self):
         # Time to check for more peers
         self.interval = None
+        self.peers = None
         try:
             config_yaml = helpers.get_config_yaml()
             with open(config_yaml.get(TORRENT_FILE_PATH_KEY), 'rb') as f:
@@ -28,11 +29,11 @@ class Torrent:
         self.info_length = data['info']['length']
         self.info_name = data['info']['name']
         self.info_piece_length = data['info']['piece length']
-        self.info_pieces_list = list([data['info']['pieces'][i:i+PIECES_BYTES_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_BYTES_LENGTH)])
-        self.info_pieces = set([data['info']['pieces'][i:i+PIECES_BYTES_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_BYTES_LENGTH)])
-        self.info_pieces_state = defaultdict(int)
-        for piece_hash in self.info_pieces:
-            self.info_pieces_state.add(piece_hash)
+        self.info_pieces_list = list([data['info']['pieces'][i:i+PIECES_HASH_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_HASH_LENGTH)]) # 20 byte sha1 hash values for each piece
+        self.info_pieces_remaining = set([data['info']['pieces'][i:i+PIECES_HASH_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_HASH_LENGTH)])
+        self.info_pieces = {} # sha1 hash of each piece and their index in the concatenation of the 20 byte sha1 hashes above
+        for i in range(len(self.info_pieces_list)):
+            self.info_pieces[self.info_pieces_list[i]] = i
         self.url_list = data['url-list']
         self.peerID = secrets.token_bytes(20)
         self.info_hash = hashlib.sha1(bencode(data['info'])).hexdigest()
@@ -56,10 +57,10 @@ class Torrent:
         print(self.peerID)
         for piece in self.info_pieces:
             print(piece)
-        print(self.info_pieces_state)
 
     def get_peers_from_response(self, response):
         assert isinstance(response, requests.Response)
         decoded = bdecode(response.content)
         self.interval = decoded['interval']
+        self.peers = decoded['peers']
         return decoded['peers']
