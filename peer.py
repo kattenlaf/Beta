@@ -173,12 +173,8 @@ class Piece:
         self.downloaded += block.block_len
         self.backlog -= 1
 
-    def isdownloading(self):
+    def is_downloading(self):
         return self.downloaded < self.piece_length
-
-    def place_piece_in_final_buffer(self, file_buffer: bytearray):
-        if self.is_piece_downloaded():
-            file_buffer[self.begin:self.end] = self.buffer
 
 class Peer:
     def __init__(self):
@@ -479,11 +475,17 @@ class Peer:
             if self.peers_available_for_use[peer] != False:
                 return peer
 
-        return False
+        return None
 
     def remove_peer_to_connect_to(self, connected_peer: Outside_Peer):
         del self.peers_available_for_use[Outside_Peer] # may not work if python still things this key is unhashable, fix
 
+
+    # Flow of torrent client
+    # 1. Make a request to the torrent tracker to get a list of available peers we can download from, and who will potentially download from us
+    # 2. After obtaining the list of peers, choose peers to make a request to for a specific piece
+    # 3. Download the piece and place it in the appropriate place in the bytearray
+    # 4. After all pieces are downloaded assemble the pieces in the correct order
     def start(self):
         ping_tracker_for_info = True
         # ping tracker for peer info only if we have exceeded the duration
