@@ -1,11 +1,13 @@
 import hashlib
 import yaml
-from enum import Enum
+from enum import IntEnum
+
+from peer import PSTRLEN_BYTES_LEN, PSTR_BYTES_LEN, RESERVED_BYTES_LEN, INFO_HASH_BYTES_LEN, PEER_ID_BYTES_LEN
 
 CONFIG_FILE_PATH = 'config.yaml'
 PORT = 80
 
-class MessageLength(Enum):
+class MessageLength(IntEnum):
     BITFIELD = 1 # 1 + X
     UNCHOKE = 1
     CHOKE = 1
@@ -16,7 +18,7 @@ class MessageLength(Enum):
     REQUEST = 13
     CANCEL = 13
 
-class MessageId(Enum):
+class MessageId(IntEnum):
     CHOKE = 0
     UNCHOKE = 1
     INTERESTED = 2
@@ -27,7 +29,7 @@ class MessageId(Enum):
     PIECE = 7
     CANCEL = 8
 
-class Pieces_Download_State(Enum):
+class Pieces_Download_State(IntEnum):
     NOT_STARTED = 0
     IN_PROGRESS = 1
     COMPLETED = 2

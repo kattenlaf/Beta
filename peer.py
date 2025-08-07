@@ -379,8 +379,8 @@ class Peer:
                 block_size = remaining_piece
             # request: <len=0013><id=6><index><begin><length>
             piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST,
-                                                           helpers.MessageId.REQUEST, piece,
-                                                           piece.index, block_size)
+                                                           helpers.MessageId.REQUEST, piece_downloading,
+                                                           piece_downloading.index, block_size)
             sock.sendall(piece_request)
             piece_downloading.backlog += 1
             piece_downloading.requested += block_size
@@ -408,8 +408,8 @@ class Peer:
     def choose_piece_to_download(self, peer_bitfield: Bitfield) -> Piece:
         # Choose pieces based on what is pulled off the queue and what the peer bitfield possesses
         piece = None
-        for i in range(len(self.pieces_to_download_queue)):
-            current_piece = Piece(self.pieces_to_download_queue.get())
+        for i in range(self.pieces_to_download_queue.qsize()):
+            current_piece = self.pieces_to_download_queue.get()
             if peer_bitfield.has_piece(current_piece.index):
                 piece = current_piece
                 break
