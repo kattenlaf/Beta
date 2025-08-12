@@ -1,3 +1,5 @@
+import os.path
+
 from ssl import socket_error
 
 import time
@@ -190,6 +192,7 @@ class Piece:
         else:
             return False
 
+
 class Peer:
     def __init__(self):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -206,6 +209,12 @@ class Peer:
         self.bitfield = Bitfield()
         self.finished_buffer = bytearray(self.torrent_details.info_length) # where we will write all the pieces we download to
         self.init_pieces_to_download()
+
+    def place_piece_in_buffer(self, piece: Piece):
+        begin = piece.index * self.torrent_details.info_piece_length
+        end = begin + piece.piece_length
+        self.finished_buffer[begin:end] = piece.buffer
+
 
     def init_pieces_to_download(self):
         for i in range(self.number_pieces_to_download):
@@ -400,6 +409,8 @@ class Peer:
                             self.request_blocks_of_piece(sock, piece)
 
                         choked = self.read_message(sock, piece, peer_to_connect_to, choked)
+                    if not piece.is_downloading():
+                        self.place_piece_in_buffer(piece)
                 if sharing_with_peer == False:
                     self.remove_peer_to_connect_to(peer_to_connect_to)
             except TimeoutError as exc:
@@ -545,6 +556,18 @@ class Peer:
     def remove_peer_to_connect_to(self, connected_peer: Outside_Peer):
         del self.peers_available_for_use[Outside_Peer] # may not work if python still things this key is unhashable, fix
 
+    def write_finished_buffer_to_file(self):
+        if self.pieces_to_download_queue.qsize() <= 0 and len(self.finished_buffer) == self.torrent_details.info_length:
+            if os.path.exists(self.torrent_details.info_name):
+                os.remove(self.torrent_details.info_name)
+            with open(self.torrent_details.info_name, 'wb') as iso_file:
+                iso_file.write(self.finished_buffer)
+                print('')
+        else:
+            print(f'File is not fully downloaded, queue size {self.pieces_to_download_queue.qsize()}'
+                  f'\nlength of finished buffer to total length expected {len(self.finished_buffer)}:{self.torrent_details.info_length}')
+
+
     # Flow of torrent client
     # 1. Make a request to the torrent tracker to get a list of available peers we can download from, and who will potentially download from us
     # 2. After obtaining the list of peers, choose peers to make a request to for a specific piece
@@ -561,10 +584,12 @@ class Peer:
                 self.retrieve_peers_from_tracker()
                 ping_tracker_for_info = False
             try:
+                # TODO, introduce multithreading to request multiple pieces at the same time from multiple peers
                 self.request_piece_from_peer()
             except Exception as exc:
                 if str(exc) != PICKING_PEER_ERROR:
                     raise
+            self.write_finished_buffer_to_file()
             if UPLOAD_FEATURE:
                 events = self.socket_event_selector.select(timeout=None) # This is where some error occurring. Fix this tmr
                 for selector_key, event_mask in events:

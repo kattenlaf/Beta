@@ -26,9 +26,9 @@ class Torrent:
             return
 
         self.announce = data['announce']
-        self.info_length = data['info']['length']
-        self.info_name = data['info']['name']
-        self.info_piece_length = data['info']['piece length']
+        self.info_length = data['info']['length'] # total length of the file
+        self.info_name = data['info']['name'] # name of the file we are downloading
+        self.info_piece_length = data['info']['piece length'] # length of each piece we will be requesting and downloading
         self.info_pieces_list = list([data['info']['pieces'][i:i+PIECES_HASH_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_HASH_LENGTH)]) # 20 byte sha1 hash values for each piece
         self.info_pieces_remaining = set([data['info']['pieces'][i:i+PIECES_HASH_LENGTH] for i in range(0, len(data['info']['pieces']), PIECES_HASH_LENGTH)])
         self.info_pieces = {} # sha1 hash of each piece and their index in the concatenation of the 20 byte sha1 hashes above
