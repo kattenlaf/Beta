@@ -384,18 +384,23 @@ class Peer:
                     # we are able to share with peer, so we are no longer choked
                     choked = False
                     piece = self.choose_piece_to_download(peer_to_connect_to.bitfield)
+                    requested_piece = False
                     if piece is None: # peer does not have a piece we want
                         sharing_with_peer = False
                     while sharing_with_peer and piece.is_downloading():
                         if not choked:
                             # request: <len=0013><id=6><index><begin><length>
-                            # TODO continue from here, ensure piece request is formed properly
-                            piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST,
-                                                                           helpers.MessageId.REQUEST, piece,
-                                                                           piece.index, BLOCK_BUFFER_SIZE)
-                            sock.sendall(piece_request)
+                            # only request piece once
+                            if not requested_piece:
+                                piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST,
+                                                                               helpers.MessageId.REQUEST, piece,
+                                                                               piece.index, BLOCK_BUFFER_SIZE)
+                                sock.sendall(piece_request)
+                                requested_piece = True
+
+                            # continuously request blocks of the piece until finished downloading
                             self.request_blocks_of_piece(sock, piece)
-                            choked = self.read_message(sock, piece, peer_to_connect_to, choked)
+                        choked = self.read_message(sock, piece, peer_to_connect_to, choked)
                 if sharing_with_peer == False:
                     self.remove_peer_to_connect_to(peer_to_connect_to)
             except TimeoutError as exc:
