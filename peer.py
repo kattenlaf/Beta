@@ -148,9 +148,11 @@ class Handshake:
 class Block:
     def __init__(self, payload, length):
         # first integer for index 4 bytes
-        self.index = int(payload[0:4])
+        index = payload[0:4]
+        self.index = int.from_bytes(index)
         # second integer for byte offset within the piece
-        self.begin = int(payload[4:8])
+        begin = payload[4:8]
+        self.begin = int.from_bytes(begin)
         # rest is for the block of data
         self.data_block = payload[8:length+8]
         self.block_len = len(self.data_block)
@@ -321,7 +323,7 @@ class Peer:
         for potential_peer in self.peers_available_for_use.keys():
             if self.peers_available_for_use[potential_peer] == True:
                 retries = 0
-                while retries < MAX_RETRIES_TO_CONNECT:
+                while retries < PEER_CONNECTION_RETRIES:
                     try:
                         sock.connect(potential_peer.address)
                         self.peers_available_for_use[potential_peer] = False
@@ -338,7 +340,7 @@ class Peer:
                     except Exception as exc:
                         print(f"Unexpected error: {exc}")
                         retries = retry_delay(retries)
-                print(f"Failed to connect to {potential_peer.address} after {MAX_RETRIES_TO_CONNECT} max retry attempts")
+                print(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
 
         return sock, None
 
@@ -388,13 +390,14 @@ class Peer:
                         if not choked:
                             # request: <len=0013><id=6><index><begin><length>
                             # TODO continue from here, ensure piece request is formed properly
-                            piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST, helpers.MessageId.REQUEST, piece, piece.index, BLOCK_BUFFER_SIZE)
+                            piece_request = self.construct_message_to_send(helpers.MessageLength.REQUEST,
+                                                                           helpers.MessageId.REQUEST, piece,
+                                                                           piece.index, BLOCK_BUFFER_SIZE)
                             sock.sendall(piece_request)
                             self.request_blocks_of_piece(sock, piece)
                             choked = self.read_message(sock, piece, peer_to_connect_to, choked)
                 if sharing_with_peer == False:
                     self.remove_peer_to_connect_to(peer_to_connect_to)
-
             except TimeoutError as exc:
                 print(f"Timeout connecting to peer with ip:port, {peer_to_connect_to.IP}:{peer_to_connect_to.port}")
                 retry += 1
@@ -405,6 +408,8 @@ class Peer:
             except Exception as exc:
                 print(f"Unhandled Exception occurred:{exc}")
                 raise
+
+        sock.close()
 
     def request_blocks_of_piece(self, sock: socket.socket, piece_downloading: Piece):
         while piece_downloading.backlog < MAXBACKLOG and piece_downloading.requested < piece_downloading.piece_length:
@@ -471,7 +476,7 @@ class Peer:
 
     def construct_message_to_send(self, messagelen: int, messageId: helpers.MessageId, piece: Piece, messageBegin: int, messageLength: int):
         message_to_send = (messagelen.to_bytes(4, "big") +
-                   helpers.MessageId.value.to_bytes() +
+                   messageId.value.to_bytes() +
                    piece.index.to_bytes(4, "big") +
                    messageBegin.to_bytes(4, "big") +
                    messageLength.to_bytes(4, "big"))
