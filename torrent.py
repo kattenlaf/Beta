@@ -46,7 +46,7 @@ class Torrent:
             'compact':'1',
             'left':str(self.info_length)
         }
-        self.print_torrent_data()
+        # self.print_torrent_data()
 
     def print_torrent_data(self):
         print(self.announce)

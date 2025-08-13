@@ -6,4 +6,6 @@ communication protocols and multi-peer communication.
 ## Installing and Running
 `pip install requirements.txt`
 
+Place the path of the torrent file in the `config.yaml` file.
+
 `python main.py`

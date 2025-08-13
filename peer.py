@@ -1,39 +1,26 @@
+import hashlib
 import os.path
-
-from ssl import socket_error
-
 import time
-
-from _datetime import timedelta
-
-import helpers
-import torrent
-
 import types
 import socket, socketserver
 import threading
-import multiprocessing
 import selectors # https://realpython.com/python-sockets/
-from datetime import datetime
 import urllib
 import requests
 import struct
-from collections import defaultdict
 import random
+import logging
+from collections import defaultdict
 from queue import Queue
+from datetime import datetime
+from ssl import socket_error
+from _datetime import timedelta
+# Personal files
+import helpers
+import torrent
 from helpers import PSTRLEN_BYTES_LEN, PSTR_BYTES_LEN, RESERVED_BYTES_LEN, INFO_HASH_BYTES_LEN, PEER_ID_BYTES_LEN
 
-# https://docs.python.org/3/library/socket.html
-
-class Book:
-    def __init__(self):
-        self.author = 'Mark Twain'
-
-    def release(self):
-        self.year = '1889'
-
-DEFAULT_PORT = 80
-LOCAL_HOST = '127.0.0.1'
+# Some constants
 BLOCK_BUFFER_SIZE = 16384 # 16KB per block size, 16384 BYTES
 PIECE_BUFFER_SIZE = 262144 # 262KB per piece size, 256000 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
@@ -44,6 +31,7 @@ MAX_RETRIES_TO_CONNECT = 2
 RETRY_AFTER = 10
 PEER_CONNECTION_RETRIES = 5 # maximum retries to connect to peers
 DELAY_TO_CONNECT = 1 # delay to make initial socket connection to peer
+NUM_OF_THREADS_FOR_DOWNLOAD = 15
 # Choke related constants
 CHECK_IFCHOKED_AFTER = 10
 CHOKE_TIMEOUT = 30
@@ -61,9 +49,21 @@ MAXBACKLOG = 5
 
 HOST = '0.0.0.0'
 PORT = 23560
+USABLE_PORTS = [PORT + _ for _ in range(PORT, PORT + NUM_OF_THREADS_FOR_DOWNLOAD + 20, 1)] # 20 extra threads
+SERVER_PORT = 23559
 
 # Error messages
 PICKING_PEER_ERROR = "Error picking peer"
+
+# semaphore locks for some resources
+peer_connection_lock = threading.Lock() # lock related to connecting to a peer
+downloading_lock = threading.Lock() # lock related to downloading
+
+logging.basicConfig(
+    filename='error.log',
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Each peer/node is both a client and a server, should have way to send file and receive
 # https://stackoverflow.com/questions/70962218/understanding-the-requisites-that-allow-bittorrent-peers-to-connect-to-each-othe
@@ -172,9 +172,9 @@ class Piece:
         self.piece_length = self.end - self.begin
         self.buffer = bytearray(self.piece_length)
         self.piece_hash = piece_hash
-        self.downloaded = 0 # blocks downloaded
-        self.requested = 0 # blocks requested?
-        self.backlog = 0 # idk
+        self.downloaded = 0 # bytes downloaded
+        self.requested = 0 # bytes requested
+        self.backlog = 0 # how many blocks have been requested
 
     def place_block_in_buffer(self, block: Block):
         if block.begin >= len(self.buffer):
@@ -208,25 +208,64 @@ class Peer:
         self.pieces_to_download_queue = Queue(maxsize=self.number_pieces_to_download)
         self.bitfield = Bitfield()
         self.finished_buffer = bytearray(self.torrent_details.info_length) # where we will write all the pieces we download to
+        self.downloaded = 0
         self.init_pieces_to_download()
 
+    # UPLOAD SKELETON -------------------
+    def setup_server_sock(self):
+        self.server_sock.bind((HOST, SERVER_PORT))
+        self.server_sock.listen(MAX_PEERS_TO_SHARE_WITH)
+        self.server_sock.setblocking(False)
+        self.socket_event_selector.register(self.server_sock, selectors.EVENT_READ, data=None)
+
+    def accept_connections(self, server_sock):
+        connection_socket, addr = server_sock.accept()
+        connection_socket.setblocking(False)
+        data = types.SimpleNamespace(addr=addr, inb=b"", outb=b"")
+        self.times_peers_last_sent[connection_socket.getpeername()] = datetime.now()
+        events = selectors.EVENT_READ | selectors.EVENT_WRITE
+        self.socket_event_selector.register(connection_socket, events, data=data)
+
+    # bare bones implementation of how selector sockets will work
+    def service_connection(self, key, mask):
+        socket_connection = key.fileobj
+        data = key.data
+        remote_addr = socket_connection.getpeername()
+        if mask & selectors.EVENT_READ:
+            self.read_data(socket_connection, data)
+        self.populate_data_to_send(data)
+        if mask & selectors.EVENT_WRITE and remote_addr in self.times_peers_last_sent:
+            if data.outb:
+                bytes_sent = socket_connection.send(data.outb[:TEST_FILE_BUFFER_SIZE])
+                socket_connection.send(b'\n')
+                print(f'Sent to client\n{data.outb[:bytes_sent]}')
+                data.outb = data.outb[bytes_sent:]
+
+    # ------------
+
+    def check_piece_integrity(self, piece: Piece):
+        download_piece_hash = bytes.fromhex(hashlib.sha1(piece.buffer).hexdigest())
+        return download_piece_hash == piece.piece_hash
+
     def place_piece_in_buffer(self, piece: Piece):
+        if not self.check_piece_integrity(piece):
+            # Put piece back on queue if there's an issue doing checksum after downloading it
+            piece = Piece(piece.piece_hash, piece.index, self.torrent_details.info_piece_length, self.torrent_details.info_length)
+            self.pieces_to_download_queue.put(piece)
+            return False
         begin = piece.index * self.torrent_details.info_piece_length
         end = begin + piece.piece_length
         self.finished_buffer[begin:end] = piece.buffer
-
+        self.downloaded += piece.downloaded
+        percentage_completed = (self.downloaded / self.torrent_details.info_length) * 100
+        print(f'Piece with index {piece.index} has finished downloading, progress -> {percentage_completed:.2f}%')
+        return True
 
     def init_pieces_to_download(self):
         for i in range(self.number_pieces_to_download):
             piece_hash = self.torrent_details.info_pieces_list[i]
             piece = Piece(piece_hash, i, self.torrent_details.info_piece_length, self.torrent_details.info_length)
             self.pieces_to_download_queue.put(piece)
-
-    def setup_server_sock(self):
-        self.server_sock.bind((LOCAL_HOST, DEFAULT_PORT))
-        self.server_sock.listen(MAX_PEERS_TO_SHARE_WITH)
-        self.server_sock.setblocking(False)
-        self.socket_event_selector.register(self.server_sock, selectors.EVENT_READ, data=None)
 
     def retrieve_peers_from_tracker(self):
         if self.should_retrieve_peers():
@@ -287,29 +326,6 @@ class Peer:
             peers.append(Outside_Peer(ip, port))
         return peers
 
-    def accept_connections(self, server_sock):
-        connection_socket, addr = server_sock.accept()
-        connection_socket.setblocking(False)
-        data = types.SimpleNamespace(addr=addr, inb=b"", outb=b"")
-        self.times_peers_last_sent[connection_socket.getpeername()] = datetime.now()
-        events = selectors.EVENT_READ | selectors.EVENT_WRITE
-        self.socket_event_selector.register(connection_socket, events, data=data)
-
-    # bare bones implementation of how selector sockets will work
-    def service_connection(self, key, mask):
-        socket_connection = key.fileobj
-        data = key.data
-        remote_addr = socket_connection.getpeername()
-        if mask & selectors.EVENT_READ:
-            self.read_data(socket_connection, data)
-        self.populate_data_to_send(data)
-        if mask & selectors.EVENT_WRITE and remote_addr in self.times_peers_last_sent:
-            if data.outb:
-                bytes_sent = socket_connection.send(data.outb[:TEST_FILE_BUFFER_SIZE])
-                socket_connection.send(b'\n')
-                print(f'Sent to client\n{data.outb[:bytes_sent]}')
-                data.outb = data.outb[bytes_sent:]
-
     def receive_bitfield(self, sock: socket.socket):
         sock.settimeout(10)
         data = sock.recv(BLOCK_BUFFER_SIZE)
@@ -335,35 +351,32 @@ class Peer:
             time.sleep(DELAY_TO_CONNECT)
             return retries
 
+        # set lock around this for getting peer from list of peers
+        peer_connection_lock.acquire()
         for potential_peer in self.peers_available_for_use.keys():
-            if self.peers_available_for_use[potential_peer] == True:
+            if self.peers_available_for_use[potential_peer]:
                 retries = 0
                 while retries < PEER_CONNECTION_RETRIES:
                     try:
                         sock.connect(potential_peer.address)
                         self.peers_available_for_use[potential_peer] = False
+                        peer_connection_lock.release()
                         return sock, potential_peer
                     except ConnectionRefusedError as exc:
-                        print(f"Connection refused with exception: {exc}")
+                        logging.error("Connection refused with exception: %s", exc, exc_info=True)
                         retries = retry_delay(retries)
                     except socket.timeout as exc:
-                        print(f"Connection timed out: {exc}")
+                        logging.error("Connection timed out: %s", exc, exc_info=True)
                         retries = retry_delay(retries)
                     except OSError as exc:
-                        print(f"Socket error: {exc}")
+                        logging.error("Socket error: %s", exc, exc_info=True)
                         retries = retry_delay(retries)
                     except Exception as exc:
-                        print(f"Unexpected error: {exc}")
+                        logging.error("Unexpected error: %s", exc, exc_info=True)
                         retries = retry_delay(retries)
-                print(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
+                logging.error(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
 
         return sock, None
-
-    def download_driver(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind((HOST, PORT))
-        sock.settimeout(TEST_TIMEOUT)
-
 
     def request_piece_from_peer(self):
         # To implement, set up TCP connection with a peer I have
@@ -372,11 +385,14 @@ class Peer:
         # ensure I won't request the same piece again once successfully downloaded
         # things to keep in mind, if tcp connection fails I need to remove peer and get another, so store the list of peers from the request I made earlier, choose 5 to connect to and then add and remove
         # peers from the list until I need to check the tracker again
+        peer_connection_lock.acquire()
+        current_port = USABLE_PORTS.pop()
+        peer_connection_lock.release()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind((HOST, PORT))
+        sock.bind((HOST, current_port))
         sock.settimeout(TEST_TIMEOUT)
-        sock, peer_to_connect_to = self.find_peer_to_connect_to(sock)
-        if peer_to_connect_to is None or peer_to_connect_to is False:
+        sock, connected_peer = self.find_peer_to_connect_to(sock)
+        if connected_peer is None or connected_peer is False:
             raise ValueError("There are no peers available to be connected to")
         retry = 0
         while retry < MAX_RETRIES_TO_CONNECT:
@@ -386,7 +402,7 @@ class Peer:
                 choked = self.initiate_complete_handshake(sock) # Always True initially
                 # receive bitfield from peer, showing the pieces that the peer has that we can request
                 bitfield_message = self.receive_bitfield(sock)
-                peer_to_connect_to.set_bitfield(bitfield_message)
+                connected_peer.set_bitfield(bitfield_message)
                 self.send_unchoke_message(sock)
                 self.send_interested_message(sock)
                 # if handshake succeeded we are sharing with peer, we want to only stop sharing if we have been choked
@@ -398,23 +414,26 @@ class Peer:
                         break
                     # we are able to share with peer, so we are no longer choked
                     choked = False
-                    piece = self.choose_piece_to_download(peer_to_connect_to.bitfield)
-                    if piece is None: # peer does not have a piece we want
+                    piece = self.choose_piece_to_download(connected_peer.bitfield)
+                    if piece is None: # peer does not have a piece we want so we can remove from the total list of peers
                         sharing_with_peer = False
+                        self.remove_connected_peer(connected_peer)
                     while sharing_with_peer and piece.is_downloading():
                         if not choked:
                             # request: <len=0013><id=6><index><begin><length>
                             # continuously request blocks of the piece until finished downloading
                             sock.settimeout(30)
                             self.request_blocks_of_piece(sock, piece)
-
-                        choked = self.read_message(sock, piece, peer_to_connect_to, choked)
+                        choked = self.read_message(sock, piece, connected_peer, choked)
                     if not piece.is_downloading():
-                        self.place_piece_in_buffer(piece)
+                        if not self.place_piece_in_buffer(piece):
+                            sharing_with_peer = False # peer isn't trust worthy since file sent incorrectly
+                        else:
+                            print(f'Downloaded piece from peer {connected_peer.address}')
                 if sharing_with_peer == False:
-                    self.remove_peer_to_connect_to(peer_to_connect_to)
+                    self.remove_connected_peer(connected_peer)
             except TimeoutError as exc:
-                print(f"Timeout connecting to peer with ip:port, {peer_to_connect_to.IP}:{peer_to_connect_to.port}")
+                print(f"Timeout connecting to peer with ip:port, {connected_peer.IP}:{connected_peer.port}")
                 retry += 1
                 time.sleep(RETRY_AFTER)
             except socket.error as exc:
@@ -475,19 +494,20 @@ class Peer:
 
         return choked
 
-
     def choose_piece_to_download(self, peer_bitfield: Bitfield) -> Piece:
         # Choose pieces based on what is pulled off the queue and what the peer bitfield possesses
         piece = None
         for i in range(self.pieces_to_download_queue.qsize()):
+            downloading_lock.acquire()
             current_piece = self.pieces_to_download_queue.get()
             if peer_bitfield.has_piece(current_piece.index):
                 piece = current_piece
+                downloading_lock.release()
                 break
             else:
                 self.pieces_to_download_queue.put(current_piece)
+                downloading_lock.release()
         return piece
-
 
     # Have we been choked for more than 30 seconds without receiving an unchoke message
     def is_choked(self, sock: socket.socket, choked):
@@ -497,7 +517,8 @@ class Peer:
             data = sock.recv(BLOCK_BUFFER_SIZE)
             try:
                 message = Message(data)
-            except Exception:
+            except Exception as exc:
+                print(f'Exception {exc}')
                 raise Exception(PICKING_PEER_ERROR)
             if message.message_id == helpers.MessageId.UNCHOKE:
                 choked = False
@@ -545,7 +566,6 @@ class Peer:
             sock.close()
             raise
 
-    # Maybe change method to peers to download from
     def select_peer_to_connect(self) -> Outside_Peer:
         for peer in self.peers_available_for_use.keys():
             if self.peers_available_for_use[peer] != False:
@@ -553,8 +573,8 @@ class Peer:
 
         return None
 
-    def remove_peer_to_connect_to(self, connected_peer: Outside_Peer):
-        del self.peers_available_for_use[Outside_Peer] # may not work if python still things this key is unhashable, fix
+    def remove_connected_peer(self, connected_peer: Outside_Peer):
+        self.peers_available_for_use.pop(Outside_Peer, None)
 
     def write_finished_buffer_to_file(self):
         if self.pieces_to_download_queue.qsize() <= 0 and len(self.finished_buffer) == self.torrent_details.info_length:
@@ -562,12 +582,13 @@ class Peer:
                 os.remove(self.torrent_details.info_name)
             with open(self.torrent_details.info_name, 'wb') as iso_file:
                 iso_file.write(self.finished_buffer)
-                print('')
+                print(f'Successfully wrote finished buffer to file with name {self.torrent_details.info_name}')
         else:
             print(f'File is not fully downloaded, queue size {self.pieces_to_download_queue.qsize()}'
                   f'\nlength of finished buffer to total length expected {len(self.finished_buffer)}:{self.torrent_details.info_length}')
 
-
+    # -------------------------------------------
+    # Driver method for peer to start downloading
     # Flow of torrent client
     # 1. Make a request to the torrent tracker to get a list of available peers we can download from, and who will potentially download from us
     # 2. After obtaining the list of peers, choose peers to make a request to for a specific piece
@@ -585,11 +606,19 @@ class Peer:
                 ping_tracker_for_info = False
             try:
                 # TODO, introduce multithreading to request multiple pieces at the same time from multiple peers
-                self.request_piece_from_peer()
+                threads_downloading = []
+                for thd_count in range(NUM_OF_THREADS_FOR_DOWNLOAD):
+                    thread = threading.Thread(target=self.request_piece_from_peer)
+                    print(f'starting thread {thd_count}')
+                    thread.start()
+                    threads_downloading.append(thread)
+
+                for thread in threads_downloading:
+                    thread.join()
+
             except Exception as exc:
                 if str(exc) != PICKING_PEER_ERROR:
                     raise
-            self.write_finished_buffer_to_file()
             if UPLOAD_FEATURE:
                 events = self.socket_event_selector.select(timeout=None) # This is where some error occurring. Fix this tmr
                 for selector_key, event_mask in events:
@@ -597,6 +626,6 @@ class Peer:
                         self.accept_connections(selector_key.fileobj)
                     else:
                         self.service_connection(selector_key, event_mask)
-
-
-
+            else:
+                break
+        self.write_finished_buffer_to_file()
