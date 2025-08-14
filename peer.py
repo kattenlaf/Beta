@@ -24,7 +24,7 @@ from helpers import PSTRLEN_BYTES_LEN, PSTR_BYTES_LEN, RESERVED_BYTES_LEN, INFO_
 BLOCK_BUFFER_SIZE = 16384 # 16KB per block size, 16384 BYTES
 PIECE_BUFFER_SIZE = 262144 # 262KB per piece size, 256000 BYTES
 TEST_FILE_BUFFER_SIZE = 256 # for testing purposes
-MAX_PEERS_TO_SHARE_WITH = 30
+MAX_PEERS_TO_SHARE_WITH = 50
 TIMEOUT_FOR_PEER_DATA = 30
 SOCKET_CONNECT_TIMEOUT = 10
 MAX_RETRIES_TO_CONNECT = 2
@@ -49,8 +49,9 @@ MAXBACKLOG = 5
 
 HOST = '0.0.0.0'
 PORT = 23560
-USABLE_PORTS = [PORT + _ for _ in range(PORT, PORT + NUM_OF_THREADS_FOR_DOWNLOAD + 20, 1)] # 20 extra threads
+USABLE_PORTS = [PORT + _ for _ in range(PORT, PORT + NUM_OF_THREADS_FOR_DOWNLOAD + 20, 1)] # 20 extra ports for threads
 SERVER_PORT = 23559
+DELAY_FOR_FINDING_PEER = 30
 
 # Error messages
 PICKING_PEER_ERROR = "Error picking peer"
@@ -243,6 +244,9 @@ class Peer:
 
     # ------------
 
+    def finished_downloading_file(self):
+        return len(self.finished_buffer) == self.torrent_details.info_length
+
     def check_piece_integrity(self, piece: Piece):
         download_piece_hash = bytes.fromhex(hashlib.sha1(piece.buffer).hexdigest())
         return download_piece_hash == piece.piece_hash
@@ -352,29 +356,28 @@ class Peer:
             return retries
 
         # set lock around this for getting peer from list of peers
-        peer_connection_lock.acquire()
-        for potential_peer in self.peers_available_for_use.keys():
-            if self.peers_available_for_use[potential_peer]:
-                retries = 0
-                while retries < PEER_CONNECTION_RETRIES:
-                    try:
-                        sock.connect(potential_peer.address)
-                        self.peers_available_for_use[potential_peer] = False
-                        peer_connection_lock.release()
-                        return sock, potential_peer
-                    except ConnectionRefusedError as exc:
-                        logging.error("Connection refused with exception: %s", exc, exc_info=True)
-                        retries = retry_delay(retries)
-                    except socket.timeout as exc:
-                        logging.error("Connection timed out: %s", exc, exc_info=True)
-                        retries = retry_delay(retries)
-                    except OSError as exc:
-                        logging.error("Socket error: %s", exc, exc_info=True)
-                        retries = retry_delay(retries)
-                    except Exception as exc:
-                        logging.error("Unexpected error: %s", exc, exc_info=True)
-                        retries = retry_delay(retries)
-                logging.error(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
+        with peer_connection_lock:
+            for potential_peer in self.peers_available_for_use.keys():
+                if self.peers_available_for_use[potential_peer]:
+                    retries = 0
+                    while retries < PEER_CONNECTION_RETRIES:
+                        try:
+                            sock.connect(potential_peer.address)
+                            self.peers_available_for_use[potential_peer] = False
+                            return sock, potential_peer
+                        except ConnectionRefusedError as exc:
+                            logging.error("Connection refused with exception: %s", exc, exc_info=True)
+                            retries = retry_delay(retries)
+                        except socket.timeout as exc:
+                            logging.error("Connection timed out: %s", exc, exc_info=True)
+                            retries = retry_delay(retries)
+                        except OSError as exc:
+                            logging.error("Socket error: %s", exc, exc_info=True)
+                            retries = retry_delay(retries)
+                        except Exception as exc:
+                            logging.error("Unexpected error: %s", exc, exc_info=True)
+                            retries = retry_delay(retries)
+                    logging.error(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
 
         return sock, None
 
@@ -385,15 +388,26 @@ class Peer:
         # ensure I won't request the same piece again once successfully downloaded
         # things to keep in mind, if tcp connection fails I need to remove peer and get another, so store the list of peers from the request I made earlier, choose 5 to connect to and then add and remove
         # peers from the list until I need to check the tracker again
-        peer_connection_lock.acquire()
-        current_port = USABLE_PORTS.pop()
-        peer_connection_lock.release()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind((HOST, current_port))
-        sock.settimeout(TEST_TIMEOUT)
-        sock, connected_peer = self.find_peer_to_connect_to(sock)
+        while True:
+            if self.finished_downloading_file():
+                break
+            with peer_connection_lock:
+                current_port = USABLE_PORTS.pop()
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind((HOST, current_port))
+                sock.settimeout(TEST_TIMEOUT)
+                sock, connected_peer = self.find_peer_to_connect_to(sock)
+                break
+            except Exception as exc:
+                # Place the port in use back in the list of available ports to be used and reraise the exception
+                with peer_connection_lock:
+                    USABLE_PORTS.append(current_port)
+                time.sleep(DELAY_FOR_FINDING_PEER)
+        if self.finished_downloading_file():
+            return
         if connected_peer is None or connected_peer is False:
-            raise ValueError("There are no peers available to be connected to")
+            raise ValueError("Connected peer is not set")
         retry = 0
         while retry < MAX_RETRIES_TO_CONNECT:
             try:
@@ -498,15 +512,13 @@ class Peer:
         # Choose pieces based on what is pulled off the queue and what the peer bitfield possesses
         piece = None
         for i in range(self.pieces_to_download_queue.qsize()):
-            downloading_lock.acquire()
-            current_piece = self.pieces_to_download_queue.get()
-            if peer_bitfield.has_piece(current_piece.index):
-                piece = current_piece
-                downloading_lock.release()
-                break
-            else:
-                self.pieces_to_download_queue.put(current_piece)
-                downloading_lock.release()
+            with downloading_lock:
+                current_piece = self.pieces_to_download_queue.get()
+                if peer_bitfield.has_piece(current_piece.index):
+                    piece = current_piece
+                    break
+                else:
+                    self.pieces_to_download_queue.put(current_piece)
         return piece
 
     # Have we been choked for more than 30 seconds without receiving an unchoke message
@@ -615,6 +627,7 @@ class Peer:
 
                 for thread in threads_downloading:
                     thread.join()
+
 
             except Exception as exc:
                 if str(exc) != PICKING_PEER_ERROR:
