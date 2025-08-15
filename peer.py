@@ -16,10 +16,14 @@ from queue import Queue
 from datetime import datetime
 from ssl import socket_error
 from _datetime import timedelta
+import progressbar
 # Personal files
 import helpers
 import torrent
 from helpers import PSTRLEN_BYTES_LEN, PSTR_BYTES_LEN, RESERVED_BYTES_LEN, INFO_HASH_BYTES_LEN, PEER_ID_BYTES_LEN
+
+download_bar = progressbar.ProgressBar(maxval=100)
+download_bar.start()
 
 # Some constants
 BLOCK_BUFFER_SIZE = 16384 # 16KB per block size, 16384 BYTES
@@ -287,7 +291,8 @@ class Peer:
         self.downloaded += piece.downloaded
         percentage_completed = (self.downloaded / self.torrent_details.info_length) * 100
         logging.info(f'Piece with index {piece.index} has finished downloading, progress -> {percentage_completed:.2f}%')
-        self.display_download_bar(percentage_completed, True, 50)
+        download_bar.update(int(percentage_completed))
+        # self.display_download_bar(percentage_completed, True, 50)
         return True
 
     def display_download_bar(self, percentage_download_completed, should_clear_line=False, num_bars=50):
@@ -461,7 +466,6 @@ class Peer:
                     piece = self.choose_piece_to_download(connected_peer.bitfield)
                     if piece is None: # peer does not have a piece we want so we can remove from the total list of peers
                         sharing_with_peer = False
-                        self.remove_connected_peer(connected_peer)
                     while sharing_with_peer and piece.is_downloading():
                         if not choked:
                             # request: <len=0013><id=6><index><begin><length>
@@ -474,8 +478,6 @@ class Peer:
                             sharing_with_peer = False # peer isn't trust worthy since file sent incorrectly
                         else:
                             logging.debug(f'Downloaded piece from peer {connected_peer.address}')
-                if sharing_with_peer == False:
-                    self.remove_connected_peer(connected_peer)
             except TimeoutError as exc:
                 logging.error(f"Timeout connecting to peer with ip:port, {connected_peer.IP}:{connected_peer.port} %s", exc, exc_info=True)
                 retry += 1
@@ -604,7 +606,7 @@ class Peer:
                 os.remove(self.torrent_details.info_name)
             with open(self.torrent_details.info_name, 'wb') as iso_file:
                 iso_file.write(self.finished_buffer)
-                print(f'Successfully wrote finished buffer to file with name {self.torrent_details.info_name}')
+                print(f'Finished downloading file {self.torrent_details.info_name} and saved in folder {os.path.curdir}')
         else:
             print(f'File is not fully downloaded, queue size {self.pieces_to_download_queue.qsize()}'
                   f'\nlength of finished buffer to total length expected {len(self.finished_buffer)}:{self.torrent_details.info_length}')
