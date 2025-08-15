@@ -11,6 +11,7 @@ import struct
 import random
 import logging
 from collections import defaultdict
+from collections import deque
 from queue import Queue
 from datetime import datetime
 from ssl import socket_error
@@ -29,7 +30,7 @@ TIMEOUT_FOR_PEER_DATA = 30
 SOCKET_CONNECT_TIMEOUT = 10
 MAX_RETRIES_TO_CONNECT = 2
 RETRY_AFTER = 10
-PEER_CONNECTION_RETRIES = 5 # maximum retries to connect to peers
+PEER_CONNECTION_RETRIES = 3 # maximum retries to connect to peers
 DELAY_TO_CONNECT = 1 # delay to make initial socket connection to peer
 NUM_OF_THREADS_FOR_DOWNLOAD = 15
 # Choke related constants
@@ -59,6 +60,10 @@ PICKING_PEER_ERROR = "Error picking peer"
 # semaphore locks for some resources
 peer_connection_lock = threading.Lock() # lock related to connecting to a peer
 downloading_lock = threading.Lock() # lock related to downloading
+
+error_log_file = 'error.log'
+if os.path.exists(error_log_file):
+    os.remove(error_log_file)
 
 logging.basicConfig(
     filename='error.log',
@@ -203,10 +208,10 @@ class Peer:
         self.handshake_msg = Handshake(self.torrent_details.lookup_dict['info_hash'], self.torrent_details.peerID)
         self.check_peers_next = None
         self.other_peers_addresses = []
-        self.peers_available_for_use = defaultdict(lambda: False) # peers our Peer is currently using, if value is set to True, the Peer is currently connected via a socket already
         self.current_peers_available_for_use_pos = 0
         self.number_pieces_to_download = len(self.torrent_details.info_pieces_list)
         self.pieces_to_download_queue = Queue(maxsize=self.number_pieces_to_download)
+        self.peers_able_to_connect = deque()
         self.bitfield = Bitfield()
         self.finished_buffer = bytearray(self.torrent_details.info_length) # where we will write all the pieces we download to
         self.downloaded = 0
@@ -245,7 +250,7 @@ class Peer:
     # ------------
 
     def finished_downloading_file(self):
-        return len(self.finished_buffer) == self.torrent_details.info_length
+        return self.downloaded == self.torrent_details.info_length
 
     def check_piece_integrity(self, piece: Piece):
         download_piece_hash = bytes.fromhex(hashlib.sha1(piece.buffer).hexdigest())
@@ -265,6 +270,7 @@ class Peer:
         print(f'Piece with index {piece.index} has finished downloading, progress -> {percentage_completed:.2f}%')
         return True
 
+    # Place all the piece hashes to be downloaded in queue
     def init_pieces_to_download(self):
         for i in range(self.number_pieces_to_download):
             piece_hash = self.torrent_details.info_pieces_list[i]
@@ -279,25 +285,14 @@ class Peer:
                 response = requests.get(self.torrent_details.announce, params=parameters)
                 peers_from_response = self.torrent_details.get_peers_from_response(response)
                 self.other_peers_addresses = self.unmarshal(peers_from_response)
-                self.set_connected_peers()
+                self.peers_able_to_connect = deque(self.other_peers_addresses)
+                # self.set_connected_peers()
                 self.check_peers_next = datetime.now() + timedelta(seconds=self.torrent_details.interval)
             except requests.exceptions.RequestException as exc:
                 print(f'Exception making request to tracker: {exc}')
                 # retry here potentially
             except Exception as e:
                 print(f'Unhandled exception when making request to tracker: {e}')
-
-    # Selects a set of Outside_Peer objects with their ips and ports to connect to
-    def set_connected_peers(self):
-        num_of_peers_to_add = MAX_PEERS_TO_SHARE_WITH - len(self.peers_available_for_use)
-        for i in range(self.current_peers_available_for_use_pos, self.current_peers_available_for_use_pos + num_of_peers_to_add):
-            if self.current_peers_available_for_use_pos >= MAX_PEERS_TO_SHARE_WITH:
-                return
-            if i < len(self.other_peers_addresses):
-                peer_to_add = self.other_peers_addresses[i]
-                if peer_to_add not in self.peers_available_for_use:
-                    self.peers_available_for_use[peer_to_add] = True
-                    self.current_peers_available_for_use_pos += 1
 
     def get_parameters_for_requests(self, url_parameter_node, request_type):
         parameters = {}
@@ -349,36 +344,44 @@ class Peer:
         sock.sendall(message.message)
 
     def find_peer_to_connect_to(self, sock) -> Outside_Peer:
-
         def retry_delay(retries):
             retries += 1
             time.sleep(DELAY_TO_CONNECT)
             return retries
 
-        # set lock around this for getting peer from list of peers
-        with peer_connection_lock:
-            for potential_peer in self.peers_available_for_use.keys():
-                if self.peers_available_for_use[potential_peer]:
-                    retries = 0
-                    while retries < PEER_CONNECTION_RETRIES:
-                        try:
-                            sock.connect(potential_peer.address)
-                            self.peers_available_for_use[potential_peer] = False
-                            return sock, potential_peer
-                        except ConnectionRefusedError as exc:
-                            logging.error("Connection refused with exception: %s", exc, exc_info=True)
-                            retries = retry_delay(retries)
-                        except socket.timeout as exc:
-                            logging.error("Connection timed out: %s", exc, exc_info=True)
-                            retries = retry_delay(retries)
-                        except OSError as exc:
-                            logging.error("Socket error: %s", exc, exc_info=True)
-                            retries = retry_delay(retries)
-                        except Exception as exc:
-                            logging.error("Unexpected error: %s", exc, exc_info=True)
-                            retries = retry_delay(retries)
-                    logging.error(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
+        still_connecting = True
+        thread = threading.current_thread()
+        while still_connecting:
+            peer_connection_lock.acquire()
+            if self.peers_able_to_connect:
+                potential_peer = self.peers_able_to_connect.pop()
+                peer_connection_lock.release()
+            else:
+                peer_connection_lock.release()
+                break
+            retries = 0
+            while retries < PEER_CONNECTION_RETRIES:
+                try:
+                    print(f'Trying to connect to peer {potential_peer.address} with thread - {thread.name}')
+                    sock.connect(potential_peer.address)
+                    return sock, potential_peer
+                except ConnectionRefusedError as exc:
+                    logging.error("Connection refused with exception: %s", exc, exc_info=True)
+                    retries = retry_delay(retries)
+                except socket.timeout as exc:
+                    logging.error("Connection timed out: %s", exc, exc_info=True)
+                    retries = retry_delay(retries)
+                except OSError as exc:
+                    logging.error("Socket error: %s", exc, exc_info=True)
+                    retries = retry_delay(retries)
+                except Exception as exc:
+                    logging.error("Unexpected error: %s", exc, exc_info=True)
+                    retries = retry_delay(retries)
+            logging.error(f"Failed to connect to {potential_peer.address} after {PEER_CONNECTION_RETRIES} max retry attempts")
 
+            # Place the peer back onto the queue
+            with peer_connection_lock:
+                self.peers_able_to_connect.appendleft(potential_peer)
         return sock, None
 
     def request_piece_from_peer(self):
@@ -550,16 +553,6 @@ class Peer:
 
         return message_to_send
 
-    def write_block_to_piece(self, message: Message):
-        # piece: <len=0009+X><id=7><index><begin><block>
-        # TODO clean up magic numbers for this
-        block_length = message.length - 9
-        index = int(message.payload[6])
-        begin = int(message.payload[7])
-        block = message.payload[8:]
-
-        return True
-
     def initiate_complete_handshake(self, sock):
         assert isinstance(sock, socket.socket)
         handshake = Handshake(self.torrent_details.lookup_dict['info_hash'], self.torrent_details.peerID)
@@ -577,16 +570,6 @@ class Peer:
             print(f'unhandled exception occurred initiating handshake with peer: {exc}')
             sock.close()
             raise
-
-    def select_peer_to_connect(self) -> Outside_Peer:
-        for peer in self.peers_available_for_use.keys():
-            if self.peers_available_for_use[peer] != False:
-                return peer
-
-        return None
-
-    def remove_connected_peer(self, connected_peer: Outside_Peer):
-        self.peers_available_for_use.pop(Outside_Peer, None)
 
     def write_finished_buffer_to_file(self):
         if self.pieces_to_download_queue.qsize() <= 0 and len(self.finished_buffer) == self.torrent_details.info_length:
@@ -612,12 +595,10 @@ class Peer:
 
         ping_tracker_for_info = True
         while True:
-            # TODO Check to update pinging tracker for info here
             if ping_tracker_for_info:
                 self.retrieve_peers_from_tracker()
                 ping_tracker_for_info = False
             try:
-                # TODO, introduce multithreading to request multiple pieces at the same time from multiple peers
                 threads_downloading = []
                 for thd_count in range(NUM_OF_THREADS_FOR_DOWNLOAD):
                     thread = threading.Thread(target=self.request_piece_from_peer)
