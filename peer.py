@@ -61,13 +61,32 @@ PICKING_PEER_ERROR = "Error picking peer"
 peer_connection_lock = threading.Lock() # lock related to connecting to a peer
 downloading_lock = threading.Lock() # lock related to downloading
 
+# prepare debugging and error files
 error_log_file = 'error.log'
 if os.path.exists(error_log_file):
     os.remove(error_log_file)
+debug_log_file = 'debug.log'
+if os.path.exists(debug_log_file):
+    os.remove(debug_log_file)
+info_log_file = 'info.log'
+if os.path.exists(info_log_file):
+    os.remove(info_log_file)
 
 logging.basicConfig(
     filename='error.log',
     level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+logging.basicConfig(
+    filename = debug_log_file,
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+logging.basicConfig(
+    filename = info_log_file,
+    level=logging.BASIC_FORMAT,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -267,8 +286,19 @@ class Peer:
         self.finished_buffer[begin:end] = piece.buffer
         self.downloaded += piece.downloaded
         percentage_completed = (self.downloaded / self.torrent_details.info_length) * 100
-        print(f'Piece with index {piece.index} has finished downloading, progress -> {percentage_completed:.2f}%')
+        logging.info(f'Piece with index {piece.index} has finished downloading, progress -> {percentage_completed:.2f}%')
+        if os.name == 'nt':  # For Windows
+            _ = os.system('cls')
+        self.display_download_bar(percentage_completed, True, 50)
         return True
+
+    def display_download_bar(self, percentage_download_completed, should_clear_line=False, num_bars=50):
+        bars_complete = int((percentage_download_completed / 100.0) * num_bars)
+        bar = '█' * bars_complete + '-' * (num_bars - bars_complete)
+        if should_clear_line:
+            print(f"download progress... |{bar}| {percentage_download_completed:.2f}%  ", end="")
+        else:
+            print(f"download progress... |{bar}| {percentage_download_completed:.2f}%  ", end="\n")
 
     # Place all the piece hashes to be downloaded in queue
     def init_pieces_to_download(self):
@@ -446,18 +476,18 @@ class Peer:
                         if not self.place_piece_in_buffer(piece):
                             sharing_with_peer = False # peer isn't trust worthy since file sent incorrectly
                         else:
-                            print(f'Downloaded piece from peer {connected_peer.address}')
+                            logging.debug(f'Downloaded piece from peer {connected_peer.address}')
                 if sharing_with_peer == False:
                     self.remove_connected_peer(connected_peer)
             except TimeoutError as exc:
-                print(f"Timeout connecting to peer with ip:port, {connected_peer.IP}:{connected_peer.port}")
+                logging.error(f"Timeout connecting to peer with ip:port, {connected_peer.IP}:{connected_peer.port} %s", exc, exc_info=True)
                 retry += 1
                 time.sleep(RETRY_AFTER)
             except socket.error as exc:
-                print(f"Unhandled Socket exception occurred during requesting piece from peer:{exc}")
+                logging.error(f"Unhandled Socket exception occurred during requesting piece from peer: %s",exc, exc_info=True)
                 raise
             except Exception as exc:
-                print(f"Unhandled Exception occurred:{exc}")
+                logging.error(f"Unhandled Exception occurred: %s", exc, exc_info=True)
                 raise
 
         sock.close()
@@ -602,13 +632,11 @@ class Peer:
                 threads_downloading = []
                 for thd_count in range(NUM_OF_THREADS_FOR_DOWNLOAD):
                     thread = threading.Thread(target=self.request_piece_from_peer)
-                    print(f'starting thread {thd_count}')
                     thread.start()
                     threads_downloading.append(thread)
 
                 for thread in threads_downloading:
                     thread.join()
-
 
             except Exception as exc:
                 if str(exc) != PICKING_PEER_ERROR:
