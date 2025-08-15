@@ -287,8 +287,6 @@ class Peer:
         self.downloaded += piece.downloaded
         percentage_completed = (self.downloaded / self.torrent_details.info_length) * 100
         logging.info(f'Piece with index {piece.index} has finished downloading, progress -> {percentage_completed:.2f}%')
-        if os.name == 'nt':  # For Windows
-            _ = os.system('cls')
         self.display_download_bar(percentage_completed, True, 50)
         return True
 
@@ -296,7 +294,7 @@ class Peer:
         bars_complete = int((percentage_download_completed / 100.0) * num_bars)
         bar = '█' * bars_complete + '-' * (num_bars - bars_complete)
         if should_clear_line:
-            print(f"download progress... |{bar}| {percentage_download_completed:.2f}%  ", end="")
+            print(f"download progress... |{bar}| {percentage_download_completed:.2f}%  ", end="\n")
         else:
             print(f"download progress... |{bar}| {percentage_download_completed:.2f}%  ", end="\n")
 
@@ -392,7 +390,6 @@ class Peer:
             retries = 0
             while retries < PEER_CONNECTION_RETRIES:
                 try:
-                    print(f'Trying to connect to peer {potential_peer.address} with thread - {thread.name}')
                     sock.connect(potential_peer.address)
                     return sock, potential_peer
                 except ConnectionRefusedError as exc:
